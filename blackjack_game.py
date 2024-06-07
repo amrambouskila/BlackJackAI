@@ -6,7 +6,10 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 # Third-party library imports
+import matplotlib
+import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -15,16 +18,99 @@ import torch.nn as nn
 import torch.optim as optim
 from PIL import Image, ImageTk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D
-from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D, Input, Layer
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import Callback
+from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 # Local application imports
 import tkinter as tk
 from tkinter import messagebox
 
+matplotlib.use('Qt5Agg', force=True)
+sns.set()
 
-def train_model(data_path: str = './data', epochs: int = 100):
+
+# Custom ReLU with B-spline parameters
+class BSplineReLU(Layer):
+    def __init__(self, **kwargs):
+        super(BSplineReLU, self).__init__(**kwargs)
+        self.control_points = self.add_weight(name='control_points', shape=(4,), initializer='ones', trainable=True)
+
+    def call(self, inputs):
+        # Example logic to incorporate B-spline control points into ReLU (simplified for illustration)
+        relu_output = tf.nn.relu(inputs)
+        spline_output = relu_output * self.control_points[0] + (1 - relu_output) * self.control_points[1]
+        return spline_output
+
+
+# Custom KAN layer
+class KANConv2D(Layer):
+    def __init__(self, filters, kernel_size, **kwargs):
+        super(KANConv2D, self).__init__(**kwargs)
+        self.conv = Conv2D(filters, kernel_size, **kwargs)
+        self.b_spline_relu = BSplineReLU()
+
+    def call(self, inputs):
+        x = self.conv(inputs)
+        return self.b_spline_relu(x)
+
+
+# KAN model
+def KANCNN(input_shape, num_classes):
+    inputs = Input(shape=input_shape)
+    x = KANConv2D(32, (3, 3))(inputs)
+    x = MaxPooling2D((2, 2))(x)
+    x = KANConv2D(64, (3, 3))(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = KANConv2D(128, (3, 3))(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = Flatten()(x)
+    x = Dense(512)(x)
+    x = BSplineReLU()(x)
+    x = Dropout(0.5)(x)
+    outputs = Dense(num_classes, activation='softmax')(x)
+    model = Model(inputs, outputs)
+    return model
+
+
+# Function to update the plot
+def update_plot(fig, epoch, train_losses, val_losses, lrs, control_points_values, weights_stats):
+    plt.clf()
+
+    # Plot training and validation loss
+    plt.subplot(1, 2, 1)
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss')
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.plot(range(1, len(lrs) + 1), lrs, label='Learning Rate')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss / Learning Rate')
+    plt.legend()
+
+    # Plot weight statistics
+    plt.subplot(1, 2, 2)
+    if len(weights_stats) > 0:
+        for layer_idx in range(len(weights_stats[0])):
+            means = [stat[layer_idx]['mean'] for stat in weights_stats]
+            stds = [stat[layer_idx]['std'] for stat in weights_stats]
+            plt.plot(range(1, len(weights_stats) + 1), means, label=f'Weights Layer {layer_idx} Mean')
+            plt.fill_between(range(1, len(weights_stats) + 1), np.array(means) - np.array(stds),
+                             np.array(means) + np.array(stds), alpha=0.2)
+
+    plt.title('Weights Mean and Std Dev Over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Value')
+    plt.legend()
+
+    plt.suptitle(f'Epoch {epoch + 1}')
+    plt.pause(0.1)
+    fig.canvas.draw()
+
+
+# Custom training loop
+def train_model(data_path: str = './data', epochs: int = 100, use_kan: bool = True):
     # Define the paths
     train_dir = f'{data_path}/train'
     valid_dir = f'{data_path}/valid'
@@ -60,9 +146,12 @@ def train_model(data_path: str = './data', epochs: int = 100):
     )
 
     model_path = f'./models/{epochs}_model.h5'
+    input_shape = (224, 224, 3)
+    num_classes = 53  # 53 classes for 53 cards
+
     if Path(model_path).exists():
-        model = Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=(224, 224, 3)),
+        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
+            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
             MaxPooling2D((2, 2)),
             Conv2D(64, (3, 3), activation='relu'),
             MaxPooling2D((2, 2)),
@@ -71,7 +160,7 @@ def train_model(data_path: str = './data', epochs: int = 100):
             Flatten(),
             Dense(512, activation='relu'),
             Dropout(0.5),
-            Dense(53, activation='softmax')  # 53 classes for 53 cards
+            Dense(num_classes, activation='softmax')
         ])
         model.compile(optimizer='adam',
                       loss='categorical_crossentropy',
@@ -79,8 +168,8 @@ def train_model(data_path: str = './data', epochs: int = 100):
         model.load_weights(model_path)  # Load your trained model weights
         return model
     else:
-        model = Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=(224, 224, 3)),
+        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
+            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
             MaxPooling2D((2, 2)),
             Conv2D(64, (3, 3), activation='relu'),
             MaxPooling2D((2, 2)),
@@ -89,19 +178,61 @@ def train_model(data_path: str = './data', epochs: int = 100):
             Flatten(),
             Dense(512, activation='relu'),
             Dropout(0.5),
-            Dense(53, activation='softmax')  # 53 classes for 53 cards
+            Dense(num_classes, activation='softmax')
         ])
 
         model.compile(optimizer='adam',
                       loss='categorical_crossentropy',
                       metrics=['accuracy'])
 
-        # Train the model
-        history = model.fit(
-            train_generator,
-            epochs=epochs,
-            validation_data=valid_generator
-        )
+        # Custom training loop to update B-spline parameters and weights
+        train_losses = []
+        val_losses = []
+        lrs = []
+        control_points_values = []
+        weights_stats = []
+
+        fig = plt.figure(figsize=(16, 6))
+        for epoch in range(epochs):
+            print(f'Epoch {epoch + 1}/{epochs}')
+            history = model.fit(train_generator, validation_data=valid_generator, epochs=1)
+
+            train_loss = history.history['loss'][0]
+            val_loss = history.history['val_loss'][0]
+            lr = model.optimizer.learning_rate.numpy()
+
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            lrs.append(lr)
+
+            # Collect control points and weight statistics
+            control_points = []
+            layer_weights_stats = []
+            for layer in model.layers:
+                if isinstance(layer, BSplineReLU):
+                    control_points.append(layer.control_points.numpy())
+                if isinstance(layer, KANConv2D):
+                    weights = layer.conv.get_weights()[0]
+                    mean = np.mean(weights)
+                    std = np.std(weights)
+                    layer_weights_stats.append({'mean': mean, 'std': std})
+
+            control_points_values.append(control_points)
+            weights_stats.append(layer_weights_stats)
+
+            update_plot(fig, epoch, train_losses, val_losses, lrs, control_points_values, weights_stats)
+
+            # Update B-spline parameters and control points
+            for layer in model.layers:
+                if isinstance(layer, KANConv2D) or isinstance(layer, BSplineReLU):
+                    with tf.GradientTape() as tape:
+                        tape.watch([tf.convert_to_tensor(w) for w in layer.trainable_weights])
+                        predictions = model(train_generator[0][0])
+                        loss = tf.keras.losses.categorical_crossentropy(train_generator[0][1], predictions)
+                    grads = tape.gradient(loss, layer.trainable_weights)
+                    for weight, grad in zip(layer.trainable_weights, grads):
+                        if isinstance(weight, tf.Variable):
+                            weight.assign_sub(grad * 0.01)  # Update step size
 
         # Evaluate the model
         loss, accuracy = model.evaluate(test_generator)
@@ -251,7 +382,38 @@ class BlackjackGame:
         self.active_hand = 0  # Track active hand index (0 for player hand, 1+ for split hands)
 
         # Create GUI elements
-        self.create_widgets()
+        self.player_label = tk.Label(self.root, text="Player's Hand")
+        self.player_label.pack()
+
+        self.frames_container = tk.Frame(self.root)
+        self.frames_container.pack()
+
+        self.player_frames = [tk.Frame(self.frames_container, padx=25) if i != 0 else tk.Frame(self.frames_container, padx=25, bg='lightblue') for i in range(4 * self.card_counter.n_decks)]
+        for frame in self.player_frames:
+            frame.pack(side=tk.LEFT)
+
+        self.dealer_label = tk.Label(self.root, text="Dealer's Hand")
+        self.dealer_label.pack()
+        self.dealer_frame = tk.Frame(self.root)
+        self.dealer_frame.pack()
+
+        self.hit_button = tk.Button(self.root, text="Hit", command=self.hit)
+        self.hit_button.pack(side=tk.LEFT)
+        self.stand_button = tk.Button(self.root, text="Stand", command=self.stand)
+        self.stand_button.pack(side=tk.LEFT)
+        self.split_button = tk.Button(self.root, text="Split", command=self.split)  # Add split button
+        self.split_button.pack(side=tk.LEFT)
+        self.reset_button = tk.Button(self.root, text="Reset", command=self.reset_game)
+        self.reset_button.pack(side=tk.LEFT)
+
+        self.prob_label = tk.Label(self.root, text="Probabilities - High: 0.00, Low: 0.00, Neutral: 0.00")
+        self.prob_label.pack()
+
+        self.game_label = tk.Label(self.root, text="Game 1: Wins - 0, Losses - 0, Draws - 0 -- Cards Left = 416")
+        self.game_label.pack()
+
+        self.wallet_label = tk.Label(self.root, text=f"Bankroll: ${self.bankroll}")
+        self.wallet_label.pack()
 
     def load_model(self):
         model = Sequential([
@@ -281,40 +443,6 @@ class BlackjackGame:
                 range(self.card_counter.n_decks)]
         # random.shuffle(deck)
         return deck
-
-    def create_widgets(self):
-        self.player_label = tk.Label(self.root, text="Player's Hand")
-        self.player_label.pack()
-
-        self.frames_container = tk.Frame(self.root)
-        self.frames_container.pack()
-
-        self.player_frame = [tk.Frame(self.frames_container, padx=25) for i in range(4 * self.card_counter.n_decks) if
-                             i != 0 else tk.Frame(self.frames_container, padx=25, bg='lightblue')]
-        self.player_frame.pack(side=tk.LEFT)
-
-        self.dealer_label = tk.Label(self.root, text="Dealer's Hand")
-        self.dealer_label.pack()
-        self.dealer_frame = tk.Frame(self.root)
-        self.dealer_frame.pack()
-
-        self.hit_button = tk.Button(self.root, text="Hit", command=self.hit)
-        self.hit_button.pack(side=tk.LEFT)
-        self.stand_button = tk.Button(self.root, text="Stand", command=self.stand)
-        self.stand_button.pack(side=tk.LEFT)
-        self.split_button = tk.Button(self.root, text="Split", command=self.split)  # Add split button
-        self.split_button.pack(side=tk.LEFT)
-        self.reset_button = tk.Button(self.root, text="Reset", command=self.reset_game)
-        self.reset_button.pack(side=tk.LEFT)
-
-        self.prob_label = tk.Label(self.root, text="Probabilities - High: 0.00, Low: 0.00, Neutral: 0.00")
-        self.prob_label.pack()
-
-        self.game_label = tk.Label(self.root, text="Game 1: Wins - 0, Losses - 0, Draws - 0 -- Cards Left = 416")
-        self.game_label.pack()
-
-        self.wallet_label = tk.Label(self.root, text=f"Bankroll: ${self.bankroll}")
-        self.wallet_label.pack()
 
     def start_game(self):
         self.deal_card_to_player()
