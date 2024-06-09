@@ -136,19 +136,25 @@ def update_plot(fig, axs, epoch, train_losses, val_losses, lrs, weights_stats, c
             stds_gamma = [stat[layer_idx].get('std_gamma', 0) for stat in weights_stats]
             means_beta = [stat[layer_idx].get('mean_beta', 0) for stat in weights_stats]
             stds_beta = [stat[layer_idx].get('std_beta', 0) for stat in weights_stats]
+            moving_mean = [stat[layer_idx].get('moving_mean', 0) for stat in weights_stats]
+            moving_variance = [stat[layer_idx].get('moving_variance', 0) for stat in weights_stats]
 
-            if 'mean' in weights_stats[0][layer_idx]:
-                axs[1].plot(range(1, len(weights_stats) + 1), means, label=f'Layer {layer_idx} Mean')
-                axs[1].fill_between(range(1, len(weights_stats) + 1), np.array(means) - np.array(stds),
-                                    np.array(means) + np.array(stds), alpha=0.2)
             if 'mean_gamma' in weights_stats[0][layer_idx]:
                 axs[1].plot(range(1, len(weights_stats) + 1), means_gamma, label=f'Layer {layer_idx} Gamma Mean')
                 axs[1].fill_between(range(1, len(weights_stats) + 1), np.array(means_gamma) - np.array(stds_gamma),
                                     np.array(means_gamma) + np.array(stds_gamma), alpha=0.2)
-            if 'mean_beta' in weights_stats[0][layer_idx]:
+            elif 'mean_beta' in weights_stats[0][layer_idx]:
                 axs[1].plot(range(1, len(weights_stats) + 1), means_beta, label=f'Layer {layer_idx} Beta Mean')
                 axs[1].fill_between(range(1, len(weights_stats) + 1), np.array(means_beta) - np.array(stds_beta),
                                     np.array(means_beta) + np.array(stds_beta), alpha=0.2)
+            elif 'moving_mean' in weights_stats[0][layer_idx]:
+                axs[1].plot(range(1, len(weights_stats) + 1), moving_mean, label=f'Layer {layer_idx} Moving Mean / Variance')
+                axs[1].fill_between(range(1, len(weights_stats) + 1), np.array(moving_mean) - np.array(moving_variance),
+                                    np.array(moving_mean) + np.array(moving_variance), alpha=0.2)
+            elif 'mean' in weights_stats[0][layer_idx]:
+                axs[1].plot(range(1, len(weights_stats) + 1), means, label=f'Layer {layer_idx} Mean')
+                axs[1].fill_between(range(1, len(weights_stats) + 1), np.array(means) - np.array(stds),
+                                    np.array(means) + np.array(stds), alpha=0.2)
 
     axs[1].set_title('Weights Mean and Std Dev Over Epochs')
     axs[1].set_xlabel('Epoch')
@@ -160,8 +166,9 @@ def update_plot(fig, axs, epoch, train_losses, val_losses, lrs, weights_stats, c
         for layer in model.layers:
             if isinstance(layer, Conv2D):
                 weights = layer.get_weights()[0]
+                weights_2d = np.mean(weights, axis=(2, 3))
                 heatmap_ax = axs[2]
-                sns.heatmap(weights[:, :, :, 0], cmap='coolwarm', ax=heatmap_ax, cbar=False)
+                sns.heatmap(weights_2d, cmap='coolwarm', ax=heatmap_ax, cbar=False)
                 heatmap_ax.set_title(f'Heatmap of Weights for {layer.name}')
                 heatmap_ax.set_xlabel('Weights')
                 heatmap_ax.set_ylabel('Filters')
@@ -182,6 +189,23 @@ def update_plot(fig, axs, epoch, train_losses, val_losses, lrs, weights_stats, c
     fig.canvas.draw()
 
 
+@tf.function
+def train_step(model, optimizer, loss_fn, x_batch, y_batch):
+    with tf.GradientTape() as tape:
+        predictions = model(x_batch, training=True)
+        loss = loss_fn(y_batch, predictions)
+    gradients = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    return loss
+
+
+@tf.function
+def val_step(model, loss_fn, x_batch, y_batch):
+    predictions = model(x_batch, training=False)
+    loss = loss_fn(y_batch, predictions)
+    return loss
+
+
 # Custom training loop
 def train_model(data_path: str = './data', epochs: int = 100, total_patience: int = 5, use_kan: bool = False):
     # Define the paths
@@ -197,22 +221,25 @@ def train_model(data_path: str = './data', epochs: int = 100, total_patience: in
     train_generator = train_datagen.flow_from_directory(
         train_dir,
         target_size=(224, 224),
-        batch_size=64,
-        class_mode='categorical'
+        batch_size=128,
+        class_mode='categorical',
+        shuffle=True
     )
 
     valid_generator = valid_datagen.flow_from_directory(
         valid_dir,
         target_size=(224, 224),
-        batch_size=64,
-        class_mode='categorical'
+        batch_size=128,
+        class_mode='categorical',
+        shuffle=False
     )
 
     test_generator = test_datagen.flow_from_directory(
         test_dir,
         target_size=(224, 224),
-        batch_size=64,
-        class_mode='categorical'
+        batch_size=128,
+        class_mode='categorical',
+        shuffle=False
     )
 
     model_path = f'./models/{epochs}_model.h5'
@@ -236,14 +263,25 @@ def train_model(data_path: str = './data', epochs: int = 100, total_patience: in
 
     fig, axs = plt.subplots(1, 4, figsize=(18, 6))
     patience = 0
-    best_val_loss = 99999
+    best_val_loss = float('inf')
     for epoch in range(epochs):
         print(f'Epoch {epoch + 1}/{epochs}')
-        train_loss = 0
+        train_loss, val_loss = 0, 0
         total_batches = len(train_generator)
         last_printed_percentage = -1
-        for idx, (batch) in enumerate(train_generator):
-            x_batch, y_batch = batch
+        for idx in range(total_batches):
+            x_batch, y_batch = train_generator[idx]
+            progress = ((idx + 1) / total_batches) * 100  # Calculate progress as a percentage
+
+            # Check if the current progress is a multiple of 10 and different from the last printed percentage
+            if int(progress) % 10 == 0 and int(progress) != last_printed_percentage and progress >= 10:
+                print(f"Batch {idx}: {progress:.0f}%")
+                last_printed_percentage = int(progress)
+
+            train_loss += train_step(model, optimizer, loss_fn, x_batch, y_batch)
+
+        for idx in range(len(valid_generator)):
+            x_batch, y_batch = valid_generator[idx]
             progress = (idx + 1) / total_batches * 100  # Calculate progress as a percentage
 
             # Check if the current progress is a multiple of 10 and different from the last printed percentage
@@ -251,19 +289,7 @@ def train_model(data_path: str = './data', epochs: int = 100, total_patience: in
                 print(f"Batch {idx}: {progress:.0f}%")
                 last_printed_percentage = int(progress)
 
-            with tf.GradientTape() as tape:
-                predictions = model(x_batch)
-                loss = loss_fn(y_batch, predictions)
-
-            gradients = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            train_loss += loss
-
-        # Validation step
-        val_loss = 0
-        for x_batch, y_batch in valid_generator:
-            val_predictions = model(x_batch)
-            val_loss += loss_fn(y_batch, val_predictions)
+            val_loss += val_step(model, loss_fn, x_batch, y_batch)
 
         # Average the losses over batches
         train_loss /= len(train_generator)
@@ -286,19 +312,24 @@ def train_model(data_path: str = './data', epochs: int = 100, total_patience: in
                 std = np.std(weights)
                 layer_weights_stats.append({'mean': mean, 'std': std})
             elif isinstance(layer, tf.keras.layers.BatchNormalization):
-                gamma, beta = layer.get_weights()  # Assuming gamma and beta are in index 0 and 1
+                gamma, beta = layer.get_weights()[0], layer.get_weights()[1]
+                moving_mean = layer.get_weights()[2]
+                moving_variance = layer.get_weights()[3]
                 mean_gamma = np.mean(gamma)
                 std_gamma = np.std(gamma)
                 mean_beta = np.mean(beta)
                 std_beta = np.std(beta)
                 layer_weights_stats.append(
-                    {'mean_gamma': mean_gamma, 'std_gamma': std_gamma, 'mean_beta': mean_beta,
-                     'std_beta': std_beta})
+                    {
+                        'mean_gamma': mean_gamma, 'std_gamma': std_gamma, 'mean_beta': mean_beta,
+                        'std_beta': std_beta, 'moving_mean': moving_mean, 'moving_variance': moving_variance
+                    }
+                )
 
         control_points_values.append(control_points)
         weights_stats.append(layer_weights_stats)
 
-        update_plot(fig, epoch, train_losses, val_losses, lrs, weights_stats, model, control_points_values)
+        update_plot(fig, axs, epoch, train_losses, val_losses, lrs, weights_stats, control_points_values, model)
 
         # Update B-spline parameters and control points
         for layer in model.layers:
