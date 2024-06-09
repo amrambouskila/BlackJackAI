@@ -183,7 +183,7 @@ def update_plot(fig, axs, epoch, train_losses, val_losses, lrs, weights_stats, c
 
 
 # Custom training loop
-def train_model(data_path: str = './data', epochs: int = 100, use_kan: bool = False):
+def train_model(data_path: str = './data', epochs: int = 100, total_patience: int = 5, use_kan: bool = False):
     # Define the paths
     train_dir = f'{data_path}/train'
     valid_dir = f'{data_path}/valid'
@@ -235,6 +235,8 @@ def train_model(data_path: str = './data', epochs: int = 100, use_kan: bool = Fa
     weights_stats = []
 
     fig, axs = plt.subplots(1, 4, figsize=(18, 6))
+    patience = 0
+    best_val_loss = 99999
     for epoch in range(epochs):
         print(f'Epoch {epoch + 1}/{epochs}')
         train_loss = 0
@@ -246,7 +248,7 @@ def train_model(data_path: str = './data', epochs: int = 100, use_kan: bool = Fa
 
             # Check if the current progress is a multiple of 10 and different from the last printed percentage
             if int(progress) % 10 == 0 and int(progress) != last_printed_percentage and progress >= 10:
-                print(f"Progress: {progress:.0f}%")
+                print(f"Batch {idx}: {progress:.0f}%")
                 last_printed_percentage = int(progress)
 
             with tf.GradientTape() as tape:
@@ -310,6 +312,15 @@ def train_model(data_path: str = './data', epochs: int = 100, use_kan: bool = Fa
                 for weight, grad in zip(layer.trainable_weights, grads):
                     if isinstance(weight, tf.Variable):
                         weight.assign_sub(grad * 0.01)  # Update step size
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience = 0
+        else:
+            patience += 1
+            if patience >= total_patience:
+                print(f'Early stopping at epoch {epoch + 1}')
+                break
 
     # Evaluate the model
     loss, accuracy = model.evaluate(test_generator)
@@ -1988,7 +1999,7 @@ class BlackjackRL:
         self.root.mainloop()
 
 
-class DQN(tf.keras.Model):
+class DuelingDQN(tf.keras.Model):
     def __init__(self, state_size, action_size):
         super().__init__()
         self.fc1 = tf.keras.layers.Dense(state_size)
@@ -2004,9 +2015,12 @@ class DQN(tf.keras.Model):
         self.act3 = tf.keras.layers.LeakyReLU(alpha=0.01)
 
         self.dropout = tf.keras.layers.Dropout(0.5)
-        self.fc4 = tf.keras.layers.Dense(action_size)
 
-    def __call__(self, state):
+        # Separate streams for state value and advantage
+        self.value_stream = tf.keras.layers.Dense(1)
+        self.advantage_stream = tf.keras.layers.Dense(action_size)
+
+    def call(self, state):
         x = self.fc1(state)
         x = self.bn1(x)
         x = self.act1(x)
@@ -2020,8 +2034,13 @@ class DQN(tf.keras.Model):
         x = self.act3(x)
 
         x = self.dropout(x)
-        x = self.fc4(x)
-        return x
+
+        value = self.value_stream(x)
+        advantage = self.advantage_stream(x)
+
+        # Combine value and advantage to get Q-values
+        q_values = value + (advantage - tf.reduce_mean(advantage, axis=1, keepdims=True))
+        return q_values
 
 
 class DQNAgent:
@@ -2058,7 +2077,7 @@ class DQNAgent:
         self.update_target_network()
 
     def create_model(self):
-        model = DQN(self.state_size, self.action_size)
+        model = DuelingDQN(self.state_size, self.action_size)
         model.compile(optimizer=self.optimizer)
         return model
 
@@ -2102,7 +2121,8 @@ class DQNAgent:
             target = reward
             if not done:
                 next_state = tf.convert_to_tensor([next_state], dtype=tf.float32)
-                target += self.gamma * tf.reduce_max(self.target_model(next_state)[0]).numpy()
+                next_action = tf.argmax(self.model(next_state)[0]).numpy()
+                target += self.gamma * self.target_model(next_state)[0][next_action].numpy()
 
             state = tf.convert_to_tensor([state], dtype=tf.float32)
             target_f = self.model(state).numpy()
