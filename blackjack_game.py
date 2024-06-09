@@ -1203,6 +1203,7 @@ class BlackjackEnvironment:
         return value
 
     def reset(self):
+        print("Resetting game state")
         self.player_hands = [[]]
         self.player_hands_real = [[]]
         self.dealer_hand_real = []
@@ -1222,6 +1223,7 @@ class BlackjackEnvironment:
         self.player_hands_real[self.active_hand].append(second_player_card)
         self.dealer_hand.append(second_dealer_predicted_card)
         self.dealer_hand_real.append(second_dealer_card)
+        print("Dealer hand reset:", self.dealer_hand)
         
         return self.get_state()
 
@@ -1250,12 +1252,20 @@ class BlackjackEnvironment:
             if player_value > 21:
                 self.losses += 1
                 reward = -1
-                done = True
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
                 return self.get_state(), reward, done
             if player_value == 21:
                 self.blackjack_wins += 1
                 reward = 1.5
-                done = True
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
                 return self.get_state(), reward, done
             else:
                 return self.get_state(), 0, False
@@ -1522,7 +1532,7 @@ class BlackjackRL:
             self.agent.load_model(file_path)
             print(f"Model loaded from: {file_path}")
 
-    def display_hand(self, hand, frame, is_dealer=True):
+    def display_hand(self, hand, frame):
         for widget in frame.winfo_children():
             widget.destroy()
 
@@ -1537,11 +1547,6 @@ class BlackjackRL:
             images = [tf.image.decode_jpeg(tf.io.read_file(img_path), channels=3)]
             prob_high, prob_low, prob_neutral, predicted_cards = self.card_counter.count_cards(images=images)
             predicted_card = predicted_cards[0]
-            predicted_img_path = f'./data/test/{predicted_card[0]} of {predicted_card[1]}/1.jpg'
-
-            if not os.path.exists(predicted_img_path):
-                print(f"Image path does not exist: {predicted_img_path}")
-                return
 
             try:
                 img = Image.open(img_path)
@@ -1551,10 +1556,7 @@ class BlackjackRL:
                 label = tk.Label(frame, image=photo)
                 label.image = photo  # Ensure reference is kept by the label
                 label.grid(row=0, column=i)
-                frame_text = f'{card[0]} of {card[1]}'
-                if is_dealer:
-                    frame_text = f'Actual: {frame_text}\nPredicted: {predicted_card[0]} of {predicted_card[1]}'
-
+                frame_text = f'Actual: {card[0]} of {card[1]}\nPredicted: {predicted_card[0]} of {predicted_card[1]}'
                 tk.Label(frame, text=frame_text).grid(row=1, column=i)
             except Exception as e:
                 print(f"Failed to load image {img_path}: {e}")
@@ -1697,7 +1699,7 @@ class BlackjackRL:
         for idx, hand in enumerate(self.environment.player_hands_real):
             self.display_hand(hand, self.player_frames[idx])
 
-        self.display_hand(self.environment.dealer_hand_real, self.dealer_frame, is_dealer=True)
+        self.display_hand(self.environment.dealer_hand_real, self.dealer_frame)
 
     def test_agent(self, games=100):
         wins, losses, draws = 0, 0, 0
@@ -1737,8 +1739,8 @@ class DQN(nn.Module):
 
 
 class DQNAgent:
-    def __init__(self, state_size, action_space, gamma=0.99, epsilon=1.0, epsilon_min=0.01, epsilon_decay=0.995,
-                 learning_rate=0.001, batch_size=32):
+    def __init__(self, state_size, action_space, gamma=0.99, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.995,
+                 learning_rate=0.001, batch_size=32, target_update_freq=10):
         self.state_size = state_size
         self.action_size = len(action_space)
         self.action_space = action_space
@@ -1750,10 +1752,14 @@ class DQNAgent:
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.model = DQN(state_size, self.action_size)
+        self.target_model = DQN(state_size, self.action_size)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.criterion = nn.MSELoss()
         self.rewards = []
         self.action_counts = defaultdict(int)
+        self.target_update_freq = target_update_freq
+        self.episode_count = 0
+        self.update_target_network()
 
     def remember(self, state, action, reward, next_state, done):
         action_idx = self.action_space.index(action)
@@ -1762,7 +1768,11 @@ class DQNAgent:
     def act(self, state):
         if np.random.rand() <= self.epsilon:
             available_actions = self.action_space if state[-1] else [a for a in self.action_space if a != 'split']
-            return random.choice(available_actions)
+            chosen_action = random.choice(available_actions)
+            action_idx = self.action_space.index(chosen_action)
+            self.action_counts[self.action_space[action_idx]] += 1
+            return chosen_action
+
         state = torch.FloatTensor(state)
         act_values = self.model(state)
         if not state[-1]:
@@ -1780,9 +1790,9 @@ class DQNAgent:
             target = reward
             if not done:
                 next_state = torch.FloatTensor(next_state)
-                target += self.gamma * torch.max(self.model(next_state)).item()
+                target += self.gamma * torch.max(self.target_model(next_state)).item()
             state = torch.FloatTensor(state)
-            target_f = self.model(state).detach()
+            target_f = self.model(state).detach().clone()
             target_f[action_idx] = target
             self.optimizer.zero_grad()
             loss = self.criterion(self.model(state), target_f)
@@ -1790,6 +1800,14 @@ class DQNAgent:
             self.optimizer.step()
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+        self.update_target_network_periodically()
+
+    def update_target_network(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+
+    def update_target_network_periodically(self):
+        if self.episode_count % self.target_update_freq == 0:
+            self.update_target_network()
 
     def load_model(self, name):
         self.model.load_state_dict(torch.load(name))
@@ -1934,7 +1952,7 @@ class DQNBlackjackEnvironment:
 
     @dealer_hand_real.setter
     def dealer_hand_real(self, dealer_hand_real):
-        self._dealer_hand = dealer_hand_real
+        self._dealer_hand_real = dealer_hand_real
 
     @property
     def player_hands_real(self):
@@ -1982,6 +2000,7 @@ class DQNBlackjackEnvironment:
         if self.card_counter.total_cards == 0:
             self.deck = self.create_deck()
             self.card_counter.reset_deck()
+            self.probabilities = {'High': [5 / 13], 'Low': [5 / 13], 'Neutral': [3 / 13]}
 
         img_path = f'./data/test/{card[0]} of {card[1]}/1.jpg'
         images = [tf.image.decode_jpeg(tf.io.read_file(img_path), channels=3)]
@@ -2062,12 +2081,20 @@ class DQNBlackjackEnvironment:
             if player_value > 21:
                 self.losses += 1
                 reward = -1
-                done = True
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
                 return self.get_state(), reward, done
             elif player_value == 21:
                 self.blackjack_wins += 1
                 reward = 1.5
-                done = True
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
                 return self.get_state(), reward, done
             else:
                 return self.get_state(), 0, False
@@ -2159,12 +2186,6 @@ class DQNBlackjackRL:
 
         # Create frames
         self.game_frame = tk.Frame(self.root)
-        self.game_frame.pack(side=tk.LEFT, padx=10, pady=10)
-        self.stats_frame = tk.Frame(self.root)
-        self.stats_frame.pack(side=tk.RIGHT, padx=10, pady=10)
-
-        # Create frames
-        self.game_frame = tk.Frame(self.root)
         self.game_frame.pack(side=tk.LEFT, padx=self.padx, pady=self.pady, expand=True, fill='both')
         self.stats_frame = tk.Frame(self.root)
         self.stats_frame.pack(side=tk.RIGHT, padx=self.padx, pady=self.pady, expand=True, fill='both')
@@ -2177,7 +2198,7 @@ class DQNBlackjackRL:
             frame.grid(row=1, column=idx, padx=self.padx, pady=self.pady, sticky='nsew')
 
         self.dealer_label = tk.Label(self.game_frame, text="Dealer's Hand")
-        self.dealer_label.grid(row=2, column=0, columnspan=self.num_columns, pady=(self.pady * 2, 0))
+        self.dealer_label.grid(row=2, column=0, pady=self.pady)
         self.dealer_frame = tk.Frame(self.game_frame)
         self.dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady, sticky='nsew')
 
@@ -2284,45 +2305,6 @@ class DQNBlackjackRL:
             self.agent.load_model(file_path)
             print(f"Model loaded from: {file_path}")
 
-    def display_hand(self, hand, frame, is_dealer=True):
-        for widget in frame.winfo_children():
-            widget.destroy()
-
-        for i, card in enumerate(hand):
-            img_path = f'./data/test/{card[0]} of {card[1]}/1.jpg'
-
-            # Debugging: Check if the image path exists
-            if not os.path.exists(img_path):
-                print(f"Image path does not exist: {img_path}")
-                continue
-
-            images = [tf.image.decode_jpeg(tf.io.read_file(img_path), channels=3)]
-            prob_high, prob_low, prob_neutral, predicted_cards = self.card_counter.count_cards(images=images)
-            predicted_card = predicted_cards[0]
-            predicted_img_path = f'./data/test/{predicted_card[0]} of {predicted_card[1]}/1.jpg'
-
-            if not os.path.exists(predicted_img_path):
-                print(f"Image path does not exist: {predicted_img_path}")
-                return
-
-            try:
-                img = Image.open(img_path)
-                img = img.resize((100, 150), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self.card_images.append(photo)  # Keep a reference to the image
-                label = tk.Label(frame, image=photo)
-                label.image = photo  # Ensure reference is kept by the label
-                label.grid(row=0, column=i)
-                frame_text = f'{card[0]} of {card[1]}'
-                if is_dealer:
-                    frame_text = f'Actual: {frame_text}\nPredicted: {predicted_card[0]} of {predicted_card[1]}'
-
-                tk.Label(frame, text=frame_text).grid(row=1, column=i)
-            except Exception as e:
-                print(f"Failed to load image {img_path}: {e}")
-
-        return hand
-
     def update_stats(self):
         # Update cumulative rewards plot
         cumulative_rewards = np.cumsum(self.agent.rewards)
@@ -2393,6 +2375,7 @@ class DQNBlackjackRL:
         self.action_counts_canvas.draw()
 
     def log_message(self, message):
+        message = f'Episode {self.episode_count}: {message}'
         self.game_log.append(message)
         self.log_text.config(state=tk.NORMAL)
         self.log_text.insert(tk.END, message + "\n")
@@ -2414,12 +2397,8 @@ class DQNBlackjackRL:
 
     def reset_game(self):
         self.environment.reset()
-        for frame in self.player_frames:
-            for widget in frame.winfo_children():
-                widget.destroy()
-
-        for widget in self.dealer_frame.winfo_children():
-            widget.destroy()
+        self.clear_frames(self.player_frames)
+        self.clear_frames([self.dealer_frame])
 
         self.player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
         for idx, frame in enumerate(self.player_frames):
@@ -2431,6 +2410,11 @@ class DQNBlackjackRL:
 
         self.update_stats()
 
+    def clear_frames(self, frames):
+        for frame in frames:
+            for widget in frame.winfo_children():
+                widget.destroy()
+
     def train_agent(self):
         if not self.training:
             return
@@ -2439,9 +2423,14 @@ class DQNBlackjackRL:
         state = self.environment.reset()
         done = False
         while not done:
+            if not self.root:
+                return
+
             self.root.update_idletasks()
             self.root.update()
             action = self.agent.act(state)
+            self.log_message(f"Player Hand: {self.environment.player_hands[self.environment.active_hand]}")
+            self.log_message(f"Action: {action}")
             next_state, reward, done = self.environment.step(action)
             self.agent.remember(state, action, reward, next_state, done)
             self.agent.replay()
@@ -2451,17 +2440,56 @@ class DQNBlackjackRL:
                 self.episode_count += 1
                 self.agent.rewards.append(reward)
                 self.update_stats()
-                self.log_message(f"Episode {self.episode_count}: Reward {reward}")
+                self.log_message(f"Reward {reward}")
                 self.root.after(1000, self.train_agent)
                 break
 
             self.root.after(1000, lambda: None)  # Add delay for visualization
 
     def update_hand_display(self):
-        for idx, hand in enumerate(self.environment.player_hands_real):
-            self.display_hand(hand, self.player_frames[idx])
+        if not self.root:
+            return
 
-        self.display_hand(self.environment.dealer_hand_real, self.dealer_frame, is_dealer=True)
+        # Update player hands without clearing frames
+        for idx, player_hand in enumerate(self.environment.player_hands_real):
+            for card_idx, card in enumerate(player_hand):
+                predicted_card = self.environment.player_hands[idx][card_idx]
+                img_path = f'./data/test/{card[0]} of {card[1]}/1.jpg'
+                if os.path.exists(img_path):
+                    try:
+                        img = Image.open(img_path)
+                        img = img.resize((100, 150), Image.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        self.card_images.append(photo)  # Keep a reference to the image
+                        frame = self.player_frames[idx]
+                        label = tk.Label(frame, image=photo)
+                        label.image = photo  # Ensure reference is kept by the label
+                        label.grid(row=0, column=card_idx, padx=self.padx // 2, pady=self.pady // 2)
+                        frame_text = f'Actual: {card[0]} of {card[1]}\nPredicted: {predicted_card[0]} of {predicted_card[1]}'
+                        tk.Label(frame, text=frame_text).grid(row=1, column=card_idx, padx=self.padx // 2,
+                                                              pady=self.pady // 2)
+                    except Exception as e:
+                        print(f"Failed to load image {img_path}: {e}")
+
+        # Update dealer hand
+        for idx, dealer_card in enumerate(self.environment.dealer_hand_real):
+            img_path = f'./data/test/{dealer_card[0]} of {dealer_card[1]}/1.jpg'
+            dealer_predicted_card = self.environment.dealer_hand[idx]
+            if os.path.exists(img_path):
+                try:
+                    img = Image.open(img_path)
+                    img = img.resize((100, 150), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self.card_images.append(photo)  # Keep a reference to the image
+                    frame = self.dealer_frame
+                    label = tk.Label(frame, image=photo)
+                    label.image = photo  # Ensure reference is kept by the label
+                    label.grid(row=0, column=idx, padx=self.padx // 2, pady=self.pady // 2)
+                    frame_text = f'Actual: {dealer_card[0]} of {dealer_card[1]}\nPredicted: {dealer_predicted_card[0]} of {dealer_predicted_card[1]}'
+                    tk.Label(frame, text=frame_text).grid(row=1, column=idx, padx=self.padx // 2,
+                                                          pady=self.pady // 2)
+                except Exception as e:
+                    print(f"Failed to load image {img_path}: {e}")
 
     def test_agent(self, games=100):
         wins, losses, draws = 0, 0, 0
