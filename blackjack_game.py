@@ -13,12 +13,9 @@ from matplotlib.animation import FuncAnimation
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from PIL import Image, ImageTk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D, Input, Layer
+from tensorflow.keras.layers import Conv2D, Dense, Dropout, Flatten, MaxPooling2D, Input, Layer, Add
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import Callback
 from tensorflow.keras.models import Model, Sequential
@@ -41,17 +38,15 @@ class BSplineReLU(Layer):
         self.control_points = self.add_weight(name='control_points', shape=(4,), initializer='ones', trainable=True)
 
     def call(self, inputs):
-        # Example logic to incorporate B-spline control points into ReLU (simplified for illustration)
         relu_output = tf.nn.relu(inputs)
         spline_output = relu_output * self.control_points[0] + (1 - relu_output) * self.control_points[1]
         return spline_output
 
 
-# Custom KAN layer
 class KANConv2D(Layer):
     def __init__(self, filters, kernel_size, **kwargs):
         super(KANConv2D, self).__init__(**kwargs)
-        self.conv = Conv2D(filters, kernel_size, **kwargs)
+        self.conv = Conv2D(filters, kernel_size, padding='same', **kwargs)
         self.b_spline_relu = BSplineReLU()
 
     def call(self, inputs):
@@ -59,52 +54,128 @@ class KANConv2D(Layer):
         return self.b_spline_relu(x)
 
 
-# KAN model
+def residual_block(x, filters, kernel_size):
+    shortcut = x
+    x = KANConv2D(filters, kernel_size)(x)
+    x = KANConv2D(filters, kernel_size)(x)
+    x = Add()([x, shortcut])
+    return x
+
+
 def KANCNN(input_shape, num_classes):
     inputs = Input(shape=input_shape)
     x = KANConv2D(32, (3, 3))(inputs)
     x = MaxPooling2D((2, 2))(x)
-    x = KANConv2D(64, (3, 3))(x)
+
+    x = residual_block(x, 32, (3, 3))
     x = MaxPooling2D((2, 2))(x)
-    x = KANConv2D(128, (3, 3))(x)
+
+    x = residual_block(x, 64, (3, 3))
     x = MaxPooling2D((2, 2))(x)
+
+    x = residual_block(x, 128, (3, 3))
+    x = MaxPooling2D((2, 2))(x)
+
     x = Flatten()(x)
     x = Dense(512)(x)
     x = BSplineReLU()(x)
     x = Dropout(0.5)(x)
     outputs = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(inputs, outputs)
+    return model
+
+
+def CNN(input_shape, num_classes):
+    inputs = Input(shape=input_shape)
+    x = Conv2D(32, (3, 3), activation='relu', kernel_regularizer=tf.keras.regularizers.l1_l2(l1=1e-5, l2=1e-4))(inputs)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = MaxPooling2D((2, 2))(x)
+
+    x = Conv2D(64, (3, 3), activation='relu', kernel_regularizer=tf.keras.regularizers.l1_l2(l1=1e-5, l2=1e-4))(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = MaxPooling2D((2, 2))(x)
+
+    x = Conv2D(128, (3, 3), activation='relu', kernel_regularizer=tf.keras.regularizers.l1_l2(l1=1e-5, l2=1e-4))(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = MaxPooling2D((2, 2))(x)
+
+    x = Conv2D(256, (3, 3), activation='relu', kernel_regularizer=tf.keras.regularizers.l1_l2(l1=1e-5, l2=1e-4))(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = MaxPooling2D((2, 2))(x)
+
+    x = Flatten()(x)
+    x = Dense(512, activation='relu', kernel_regularizer=tf.keras.regularizers.l1_l2(l1=1e-5, l2=1e-4))(x)
+    x = Dropout(0.5)(x)
+
+    outputs = Dense(num_classes, activation='softmax')(x)
+
     model = Model(inputs, outputs)
     return model
 
 
 # Function to update the plot
-def update_plot(fig, epoch, train_losses, val_losses, lrs, weights_stats):
+def update_plot(fig, axs, epoch, train_losses, val_losses, lrs, weights_stats, control_points_values, model):
     plt.clf()
 
     # Plot training and validation loss
-    plt.subplot(1, 2, 1)
-    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss')
-    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
-    plt.plot(range(1, len(lrs) + 1), lrs, label='Learning Rate')
-    plt.title('Training and Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss / Learning Rate')
-    plt.legend()
+    axs[0].plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss')
+    axs[0].plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    axs[0].plot(range(1, len(lrs) + 1), lrs, label='Learning Rate')
+    axs[0].set_title('Training and Validation Loss')
+    axs[0].set_xlabel('Epoch')
+    axs[0].set_ylabel('Loss / Learning Rate')
+    axs[0].legend()
 
     # Plot weight statistics
-    plt.subplot(1, 2, 2)
     if len(weights_stats) > 0:
         for layer_idx in range(len(weights_stats[0])):
-            means = [stat[layer_idx]['mean'] for stat in weights_stats]
-            stds = [stat[layer_idx]['std'] for stat in weights_stats]
-            plt.plot(range(1, len(weights_stats) + 1), means, label=f'Weights Layer {layer_idx} Mean')
-            plt.fill_between(range(1, len(weights_stats) + 1), np.array(means) - np.array(stds),
-                             np.array(means) + np.array(stds), alpha=0.2)
+            means = [stat[layer_idx].get('mean', 0) for stat in weights_stats]
+            stds = [stat[layer_idx].get('std', 0) for stat in weights_stats]
+            means_gamma = [stat[layer_idx].get('mean_gamma', 0) for stat in weights_stats]
+            stds_gamma = [stat[layer_idx].get('std_gamma', 0) for stat in weights_stats]
+            means_beta = [stat[layer_idx].get('mean_beta', 0) for stat in weights_stats]
+            stds_beta = [stat[layer_idx].get('std_beta', 0) for stat in weights_stats]
 
-    plt.title('Weights Mean and Std Dev Over Epochs')
-    plt.xlabel('Epoch')
-    plt.ylabel('Value')
-    plt.legend()
+            if 'mean' in weights_stats[0][layer_idx]:
+                axs[1].plot(range(1, len(weights_stats) + 1), means, label=f'Layer {layer_idx} Mean')
+                axs[1].fill_between(range(1, len(weights_stats) + 1), np.array(means) - np.array(stds),
+                                    np.array(means) + np.array(stds), alpha=0.2)
+            if 'mean_gamma' in weights_stats[0][layer_idx]:
+                axs[1].plot(range(1, len(weights_stats) + 1), means_gamma, label=f'Layer {layer_idx} Gamma Mean')
+                axs[1].fill_between(range(1, len(weights_stats) + 1), np.array(means_gamma) - np.array(stds_gamma),
+                                    np.array(means_gamma) + np.array(stds_gamma), alpha=0.2)
+            if 'mean_beta' in weights_stats[0][layer_idx]:
+                axs[1].plot(range(1, len(weights_stats) + 1), means_beta, label=f'Layer {layer_idx} Beta Mean')
+                axs[1].fill_between(range(1, len(weights_stats) + 1), np.array(means_beta) - np.array(stds_beta),
+                                    np.array(means_beta) + np.array(stds_beta), alpha=0.2)
+
+    axs[1].set_title('Weights Mean and Std Dev Over Epochs')
+    axs[1].set_xlabel('Epoch')
+    axs[1].set_ylabel('Value')
+    axs[1].legend()
+
+    # Plot heatmap for the first Conv2D layer's weights
+    if len(weights_stats) > 0 and epoch % 5 == 0:  # Plot every 5 epochs
+        for layer in model.layers:
+            if isinstance(layer, Conv2D):
+                weights = layer.get_weights()[0]
+                heatmap_ax = axs[2]
+                sns.heatmap(weights[:, :, :, 0], cmap='coolwarm', ax=heatmap_ax, cbar=False)
+                heatmap_ax.set_title(f'Heatmap of Weights for {layer.name}')
+                heatmap_ax.set_xlabel('Weights')
+                heatmap_ax.set_ylabel('Filters')
+                break
+
+    # Plot control points
+    if len(control_points_values) > 0:
+        for idx, control_points in enumerate(control_points_values):
+            axs[3].plot(range(1, len(control_points) + 1), control_points, label=f'Control Points {idx}')
+
+    axs[3].set_title('Control Points Over Epochs')
+    axs[3].set_xlabel('Epoch')
+    axs[3].set_ylabel('Control Points Value')
+    axs[3].legend()
 
     plt.suptitle(f'Epoch {epoch + 1}')
     plt.pause(0.1)
@@ -112,14 +183,11 @@ def update_plot(fig, epoch, train_losses, val_losses, lrs, weights_stats):
 
 
 # Custom training loop
-def train_model(data_path: str = './data', epochs: int = 100, use_kan: bool = True):
+def train_model(data_path: str = './data', epochs: int = 100, use_kan: bool = False):
     # Define the paths
     train_dir = f'{data_path}/train'
     valid_dir = f'{data_path}/valid'
     test_dir = f'{data_path}/test'
-
-    # Load the CSV file
-    dataset_csv = pd.read_csv(f'{data_path}/cards.csv')
 
     # Create ImageDataGenerator for loading and augmenting images
     train_datagen = ImageDataGenerator(rescale=1. / 255)
@@ -129,119 +197,125 @@ def train_model(data_path: str = './data', epochs: int = 100, use_kan: bool = Tr
     train_generator = train_datagen.flow_from_directory(
         train_dir,
         target_size=(224, 224),
-        batch_size=32,
+        batch_size=64,
         class_mode='categorical'
     )
 
     valid_generator = valid_datagen.flow_from_directory(
         valid_dir,
         target_size=(224, 224),
-        batch_size=32,
+        batch_size=64,
         class_mode='categorical'
     )
 
     test_generator = test_datagen.flow_from_directory(
         test_dir,
         target_size=(224, 224),
-        batch_size=32,
+        batch_size=64,
         class_mode='categorical'
     )
 
     model_path = f'./models/{epochs}_model.h5'
     input_shape = (224, 224, 3)
     num_classes = 53  # 53 classes for 53 cards
+    model = KANCNN(input_shape, num_classes) if use_kan else CNN(input_shape, num_classes)
 
     if Path(model_path).exists():
-        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
-            MaxPooling2D((2, 2)),
-            Conv2D(64, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Conv2D(128, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Flatten(),
-            Dense(512, activation='relu'),
-            Dropout(0.5),
-            Dense(num_classes, activation='softmax')
-        ])
-        model.compile(optimizer='adam',
-                      loss='categorical_crossentropy',
-                      metrics=['accuracy'])
-        model.load_weights(model_path)  # Load your trained model weights
+        model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+        model.load_weights(model_path)
         return model
-    else:
-        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
-            MaxPooling2D((2, 2)),
-            Conv2D(64, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Conv2D(128, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Flatten(),
-            Dense(512, activation='relu'),
-            Dropout(0.5),
-            Dense(num_classes, activation='softmax')
-        ])
 
-        model.compile(optimizer='adam',
-                      loss='categorical_crossentropy',
-                      metrics=['accuracy'])
+    optimizer = Adam()
+    loss_fn = tf.keras.losses.CategoricalCrossentropy()
 
-        # Custom training loop to update B-spline parameters and weights
-        train_losses = []
-        val_losses = []
-        lrs = []
-        control_points_values = []
-        weights_stats = []
+    train_losses = []
+    val_losses = []
+    lrs = []
+    control_points_values = []
+    weights_stats = []
 
-        fig = plt.figure(figsize=(16, 6))
-        for epoch in range(epochs):
-            print(f'Epoch {epoch + 1}/{epochs}')
-            history = model.fit(train_generator, validation_data=valid_generator, epochs=1)
+    fig, axs = plt.subplots(1, 4, figsize=(18, 6))
+    for epoch in range(epochs):
+        print(f'Epoch {epoch + 1}/{epochs}')
+        train_loss = 0
+        total_batches = len(train_generator)
+        last_printed_percentage = -1
+        for idx, (batch) in enumerate(train_generator):
+            x_batch, y_batch = batch
+            progress = (idx + 1) / total_batches * 100  # Calculate progress as a percentage
 
-            train_loss = history.history['loss'][0]
-            val_loss = history.history['val_loss'][0]
-            lr = model.optimizer.learning_rate.numpy()
+            # Check if the current progress is a multiple of 10 and different from the last printed percentage
+            if int(progress) % 10 == 0 and int(progress) != last_printed_percentage and progress >= 10:
+                print(f"Progress: {progress:.0f}%")
+                last_printed_percentage = int(progress)
 
-            train_losses.append(train_loss)
-            val_losses.append(val_loss)
-            lrs.append(lr)
+            with tf.GradientTape() as tape:
+                predictions = model(x_batch)
+                loss = loss_fn(y_batch, predictions)
 
-            # Collect control points and weight statistics
-            control_points = []
-            layer_weights_stats = []
-            for layer in model.layers:
-                if isinstance(layer, BSplineReLU):
-                    control_points.append(layer.control_points.numpy())
-                if isinstance(layer, KANConv2D):
-                    weights = layer.conv.get_weights()[0]
-                    mean = np.mean(weights)
-                    std = np.std(weights)
-                    layer_weights_stats.append({'mean': mean, 'std': std})
+            gradients = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+            train_loss += loss
 
-            control_points_values.append(control_points)
-            weights_stats.append(layer_weights_stats)
+        # Validation step
+        val_loss = 0
+        for x_batch, y_batch in valid_generator:
+            val_predictions = model(x_batch)
+            val_loss += loss_fn(y_batch, val_predictions)
 
-            update_plot(fig, epoch, train_losses, val_losses, lrs, weights_stats)
+        # Average the losses over batches
+        train_loss /= len(train_generator)
+        val_loss /= len(valid_generator)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
 
-            # Update B-spline parameters and control points
-            for layer in model.layers:
-                if isinstance(layer, KANConv2D) or isinstance(layer, BSplineReLU):
-                    with tf.GradientTape() as tape:
-                        tape.watch([tf.convert_to_tensor(w) for w in layer.trainable_weights])
-                        predictions = model(train_generator[0][0])
-                        loss = tf.keras.losses.categorical_crossentropy(train_generator[0][1], predictions)
-                    grads = tape.gradient(loss, layer.trainable_weights)
-                    for weight, grad in zip(layer.trainable_weights, grads):
-                        if isinstance(weight, tf.Variable):
-                            weight.assign_sub(grad * 0.01)  # Update step size
+        # Learning rate (if you are changing it dynamically)
+        lrs.append(optimizer.learning_rate.numpy())
 
-        # Evaluate the model
-        loss, accuracy = model.evaluate(test_generator)
-        print(f'Test accuracy: {accuracy}')
+        # Collect control points and weight statistics
+        control_points = []
+        layer_weights_stats = []
+        for layer in model.layers:
+            if isinstance(layer, BSplineReLU):
+                control_points.append(layer.control_points.numpy())
+            elif isinstance(layer, (KANConv2D, Conv2D)):
+                weights = layer.get_weights()[0]  # Assuming weights are in index 0
+                mean = np.mean(weights)
+                std = np.std(weights)
+                layer_weights_stats.append({'mean': mean, 'std': std})
+            elif isinstance(layer, tf.keras.layers.BatchNormalization):
+                gamma, beta = layer.get_weights()  # Assuming gamma and beta are in index 0 and 1
+                mean_gamma = np.mean(gamma)
+                std_gamma = np.std(gamma)
+                mean_beta = np.mean(beta)
+                std_beta = np.std(beta)
+                layer_weights_stats.append(
+                    {'mean_gamma': mean_gamma, 'std_gamma': std_gamma, 'mean_beta': mean_beta,
+                     'std_beta': std_beta})
 
-        model.save(model_path)
+        control_points_values.append(control_points)
+        weights_stats.append(layer_weights_stats)
 
+        update_plot(fig, epoch, train_losses, val_losses, lrs, weights_stats, model, control_points_values)
+
+        # Update B-spline parameters and control points
+        for layer in model.layers:
+            if isinstance(layer, KANConv2D) or isinstance(layer, BSplineReLU):
+                with tf.GradientTape() as tape:
+                    tape.watch([tf.convert_to_tensor(w) for w in layer.trainable_weights])
+                    predictions = model(train_generator[0][0])
+                    loss = tf.keras.losses.categorical_crossentropy(train_generator[0][1], predictions)
+
+                grads = tape.gradient(loss, layer.trainable_weights)
+                for weight, grad in zip(layer.trainable_weights, grads):
+                    if isinstance(weight, tf.Variable):
+                        weight.assign_sub(grad * 0.01)  # Update step size
+
+    # Evaluate the model
+    loss, accuracy = model.evaluate(test_generator)
+    print(f'Test accuracy: {accuracy}')
+
+    model.save(model_path)
     return model
 
 
@@ -382,6 +456,10 @@ class BlackjackGame:
         self._hits = 0
         self._splits = 0
         self._stands = 0
+        self._doubles = 0
+        self._surrenders = 0
+        self._insurance_wins = 0
+        self._insurance_losses = 0
         self._hand_count = 0
         self._active_hand = 0
         self._dealer_hand = []
@@ -419,6 +497,12 @@ class BlackjackGame:
         self.stand_button.pack(side=tk.LEFT)
         self.split_button = tk.Button(self.main_container, text="Split", command=self.split)  # Add split button
         self.split_button.pack(side=tk.LEFT)
+        self.double_button = tk.Button(self.main_container, text="Double", command=self.double)  # Add double button
+        self.double_button.pack(side=tk.LEFT)
+        self.surrender_button = tk.Button(self.main_container, text="Surrender", command=self.surrender)  # Add surrender button
+        self.surrender_button.pack(side=tk.LEFT)
+        self.insurance_button = tk.Button(self.main_container, text="Insurance", command=self.insurance)  # Add insurance button
+        self.insurance_button.pack(side=tk.LEFT)
         self.reset_button = tk.Button(self.main_container, text="Reset", command=self.reset_game)
         self.reset_button.pack(side=tk.LEFT)
 
@@ -529,6 +613,38 @@ class BlackjackGame:
         self._stands = stands
 
     @property
+    def doubles(self):
+        return self._doubles
+
+    @doubles.setter
+    def doubles(self, doubles):
+        self._doubles = doubles
+
+    @property
+    def surrenders(self):
+        return self._surrenders
+
+    @surrenders.setter
+    def surrenders(self, surrenders):
+        self._surrenders = surrenders
+
+    @property
+    def insurance_wins(self):
+        return self._insurance_wins
+
+    @insurance_wins.setter
+    def insurance_wins(self, insurance_wins):
+        self._insurance_wins = insurance_wins
+
+    @property
+    def insurance_losses(self):
+        return self._insurance_losses
+
+    @insurance_losses.setter
+    def insurance_losses(self, insurance_losses):
+        self._insurance_losses = insurance_losses
+
+    @property
     def hand_count(self):
         return self._hand_count
 
@@ -611,23 +727,11 @@ class BlackjackGame:
     def log_prefix(self, idx: int):
         return f'Hand {self.hand_count}: Active Hand {idx + 1} -'
 
-    def load_model(self, use_kan: bool = True):
+    def load_model(self, use_kan: bool = False):
         input_shape = (224, 224, 3)
         num_classes = 53  # 53 classes for 53 cards
 
-        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
-            MaxPooling2D((2, 2)),
-            Conv2D(64, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Conv2D(128, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Flatten(),
-            Dense(512, activation='relu'),
-            Dropout(0.5),
-            Dense(num_classes, activation='softmax')
-        ])
-
+        model = KANCNN(input_shape, num_classes) if use_kan else CNN(input_shape, num_classes)
         model.compile(
             optimizer='adam',
             loss='categorical_crossentropy',
@@ -640,7 +744,7 @@ class BlackjackGame:
     def create_deck(self):
         deck = [(rank, suit) for rank in self.ranks.keys() for suit in self.suits for _ in
                 range(self.card_counter.n_decks)]
-        random.shuffle(deck)
+        # random.shuffle(deck)
         return deck
 
     def display_hand(self, card, is_dealer):
@@ -666,10 +770,7 @@ class BlackjackGame:
             label = tk.Label(frame, image=photo)
             label.image = photo
             label.pack()
-            frame_text = f'{card[0]} of {card[1]}'
-            if is_dealer:
-                frame_text = f'Actual: {frame_text}\nPredicted: {predicted_cards[0][0]} of {predicted_cards[0][1]}'
-
+            frame_text = f'Actual: {card[0]} of {card[1]}\nPredicted: {predicted_cards[0][0]} of {predicted_cards[0][1]}'
             tk.Label(frame, text=frame_text).pack()
         except Exception as e:
             print(f"Failed to load image {img_path}: {e}")
@@ -707,7 +808,7 @@ class BlackjackGame:
     def update_probabilities_label(self):
         self.prob_label.config(text=f'Probabilities - High: {self.probabilities["High"][-1]:.2f}, Low: {self.probabilities["Low"][-1]:.2f}, Neutral: {self.probabilities["Neutral"][-1]:.2f}')
 
-    def update_game_label(self, rewards: int):
+    def update_game_label(self, rewards):
         self.game_label.config(text=f'Game {self.regular_wins + self.blackjack_wins + self.losses + self.draws}: Blackjack Wins - {self.blackjack_wins}, Regular Wins - {self.regular_wins}, Losses - {self.losses}, Draws - {self.draws} -- Cards Left = {self.card_counter.remaining_cards["total"]}')
         self.bankroll += rewards
         self.wallet_label.config(text=f"Bankroll: ${self.bankroll}")
@@ -716,8 +817,10 @@ class BlackjackGame:
         win_data = {
             "regular_wins": self.regular_wins,
             "blackjack_wins": self.blackjack_wins,
+            "insurance_wins": self.insurance_wins,
+            "insurance_losses": self.insurance_losses,
             "losses": self.losses,
-            "draws": self.draws
+            "draws": self.draws,
         }
 
         prob_data = {
@@ -729,7 +832,9 @@ class BlackjackGame:
         action_data = {
             "hits": self.hits,
             "stands": self.stands,
-            "splits": self.splits
+            "splits": self.splits,
+            "doubles": self.doubles,
+            "surrenders": self.surrenders,
         }
 
         # Clear previous plots
@@ -751,6 +856,7 @@ class BlackjackGame:
         # Plot 3: Average Returns
         if self.hand_count > 0:
             self.axs[1, 0].plot(range(1, len(self.average_returns) + 1), self.average_returns)
+
         self.axs[1, 0].set_title("Average Returns per Hand")
         self.axs[1, 0].set_ylabel("Average Return")
         self.axs[1, 0].set_xlabel("Number of Hands")
@@ -811,6 +917,14 @@ class BlackjackGame:
         can_split = any(len(hand) == 2 and hand[0][0] == hand[1][0] for hand in self.player_hands)
         self.split_button.config(state=tk.NORMAL if can_split else tk.DISABLED)
 
+    def update_surrender_button_state(self):
+        can_surrender = len(self.player_hands) == 1 and len(self.player_hands[0]) == 2
+        self.surrender_button.config(state=tk.NORMAL if can_surrender else tk.DISABLED)
+
+    def update_insurance_button_state(self):
+        can_surrender = self.dealer_hand[0][0] == 'ace'
+        self.insurance_button.config(state=tk.NORMAL if can_surrender else tk.DISABLED)
+
     def split(self):
         # Check if the active hand can be split
         active_hand = self.player_hands[self.active_hand]
@@ -859,6 +973,45 @@ class BlackjackGame:
                         print(f"Failed to load image {img_path}: {e}")
 
         self.highlight_active_hand()
+
+        # Implement double down logic
+    def double(self):
+        self.doubles += 1
+        self.hits -= 1
+        self.stands -= 1
+        self.cost *= 2
+        self.hit()
+        self.stand()
+
+    # Implement surrender logic
+    def surrender(self):
+        if len(self.player_hands) == 1 and len(self.player_hands[0]) == 2:
+            self.surrenders += 1
+            reward = self.cost / 2
+            self.losses += 1
+            self.update_game_label(int(-reward))
+            self.returns.append(-reward)
+            self.average_returns.append(sum(self.returns) / self.hand_count)
+            message = f"{self.log_prefix(self.active_hand)} Player surrenders and loses ${reward}"
+            self.log_message(message)
+            self.reset_hand()
+
+    # Implement insurance logic
+    def insurance(self):
+        if self.dealer_hand[0][0] == 'ace':
+            insurance_cost = self.cost / 2
+            self.bankroll -= insurance_cost
+            dealer_value = self.calculate_hand_value(self.dealer_hand)
+            if dealer_value == 21:
+                self.insurance_wins += 1
+                self.bankroll += 2 * insurance_cost
+                message = f"{self.log_prefix(self.active_hand)} Insurance wins. Player gains ${insurance_cost}"
+            else:
+                self.insurance_losses += 1
+                message = f"{self.log_prefix(self.active_hand)} Insurance loses. Player loses ${insurance_cost}"
+
+            self.log_message(message)
+            self.wallet_label.config(text=f"Bankroll: ${self.bankroll}")
 
     def hit(self):
         self.deal_card(self.player_hands[self.active_hand])
@@ -915,7 +1068,7 @@ class BlackjackGame:
 
     def stand(self):
         self.stands += 1
-        if self.active_hand < len(self.player_hands) - 1:
+        if self.active_hand < len(self.player_hands):
             self.active_hand += 1
             self.highlight_active_hand()
             if self.active_hand < len(self.player_hands):
@@ -966,10 +1119,12 @@ class BlackjackGame:
     def disable_buttons(self):
         self.hit_button.config(state=tk.DISABLED)
         self.stand_button.config(state=tk.DISABLED)
+        self.double_button.config(state=tk.DISABLED)
 
     def enable_buttons(self):
         self.hit_button.config(state=tk.NORMAL)
         self.stand_button.config(state=tk.NORMAL)
+        self.double_button.config(state=tk.NORMAL)
 
     def reset_game(self):
         message = f'Game Reset after {self.hand_count} hands\nAverage return: ${sum(self.returns) / self.hand_count} / hand\nTotal return: ${self.bankroll - self.starting_bankroll}, {self.blackjack_wins} Blackjacks, {self.regular_wins} Regular Wins, {self.losses} Losses, {self.draws} Draws\n{self.hits} Hits, {self.splits} Splits, {self.stands} Stands'
@@ -1027,6 +1182,10 @@ class BlackjackEnvironment:
         self._draws = 0
         self._hits = 0
         self._splits = 0
+        self._doubles = 0
+        self._surrenders = 0
+        self._insurance_wins = 0
+        self._insurance_losses = 0
         self._stands = 0
         self._hand_count = 0
         self._active_hand = 0
@@ -1051,6 +1210,22 @@ class BlackjackEnvironment:
     @regular_wins.setter
     def regular_wins(self, regular_wins):
         self._regular_wins = regular_wins
+
+    @property
+    def insurance_wins(self):
+        return self._insurance_wins
+
+    @insurance_wins.setter
+    def insurance_wins(self, insurance_wins):
+        self._insurance_wins = insurance_wins
+
+    @property
+    def insurance_losses(self):
+        return self._insurance_losses
+
+    @insurance_losses.setter
+    def insurance_losses(self, insurance_losses):
+        self._insurance_losses = insurance_losses
 
     @property
     def losses(self):
@@ -1091,6 +1266,22 @@ class BlackjackEnvironment:
     @stands.setter
     def stands(self, stands):
         self._stands = stands
+
+    @property
+    def doubles(self):
+        return self._doubles
+
+    @doubles.setter
+    def doubles(self, doubles):
+        self._doubles = doubles
+
+    @property
+    def surrenders(self):
+        return self._surrenders
+
+    @surrenders.setter
+    def surrenders(self, surrenders):
+        self._surrenders = surrenders
 
     @property
     def hand_count(self):
@@ -1140,30 +1331,18 @@ class BlackjackEnvironment:
     def player_hands_real(self, player_hands_real):
         self._player_hands_real = player_hands_real
 
-    def load_model(self, use_kan: bool = True):
+    def load_model(self, use_kan: bool = False):
         input_shape = (224, 224, 3)
         num_classes = 53  # 53 classes for 53 cards
 
-        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
-            MaxPooling2D((2, 2)),
-            Conv2D(64, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Conv2D(128, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Flatten(),
-            Dense(512, activation='relu'),
-            Dropout(0.5),
-            Dense(num_classes, activation='softmax')
-        ])
-
+        model = KANCNN(input_shape, num_classes) if use_kan else CNN(input_shape, num_classes)
         model.compile(
             optimizer='adam',
             loss='categorical_crossentropy',
             metrics=['accuracy']
         )
 
-        model.load_weights(self.model_path)  # Load your trained model weights
+        model.load_weights(self.model_path)
         return model
 
     def create_deck(self):
@@ -1203,7 +1382,6 @@ class BlackjackEnvironment:
         return value
 
     def reset(self):
-        print("Resetting game state")
         self.player_hands = [[]]
         self.player_hands_real = [[]]
         self.dealer_hand_real = []
@@ -1223,7 +1401,6 @@ class BlackjackEnvironment:
         self.player_hands_real[self.active_hand].append(second_player_card)
         self.dealer_hand.append(second_dealer_predicted_card)
         self.dealer_hand_real.append(second_dealer_card)
-        print("Dealer hand reset:", self.dealer_hand)
         
         return self.get_state()
 
@@ -1235,15 +1412,86 @@ class BlackjackEnvironment:
     def get_state(self):
         player_hand_value = self.calculate_hand_value(self.player_hands[self.active_hand])
         dealer_upcard = self.ranks[self.dealer_hand[0][0]]
-        usable_a = self.usable_ace(self.player_hands[self.active_hand])
+        usable_a = any(card[0] == 'ace' for card in self.player_hands[self.active_hand]) and self.calculate_hand_value(self.player_hands[self.active_hand]) + 10 <= 21
         can_split = len(self.player_hands_real[self.active_hand]) == 2 and self.player_hands_real[self.active_hand][0][0] == self.player_hands_real[self.active_hand][1][0]
-        return (player_hand_value, dealer_upcard, usable_a, len(self.player_hands), can_split)
-
-    def usable_ace(self, hand):
-        return any(card[0] == 'ace' for card in hand) and self.calculate_hand_value(hand) + 10 <= 21
+        can_surrender = len(self.player_hands) == 1 and len(self.player_hands[0]) == 2
+        can_insure = self.dealer_hand[0][0] == 'ace'
+        return (player_hand_value, dealer_upcard, usable_a, len(self.player_hands), can_insure, can_surrender, can_split)
 
     def step(self, action):
-        if action == 'hit':
+        if action == 'double':
+            self.doubles += 1
+            card, predicted_card = self.deal_card()
+            self.player_hands_real[self.active_hand].append(card)
+            self.player_hands[self.active_hand].append(predicted_card)
+            player_value = self.calculate_hand_value(self.player_hands_real[self.active_hand])
+            dealer_value = self.calculate_hand_value(self.dealer_hand_real)
+            if player_value > 21:
+                self.losses += 1
+                reward = -2
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+            elif player_value == 21:
+                self.blackjack_wins += 1
+                reward = 3
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+            elif player_value > dealer_value or dealer_value > 21:
+                self.regular_wins += 1
+                reward = 2
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+            elif player_value < dealer_value <= 21:
+                self.losses += 1
+                reward = -2
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+            else:
+                self.draws += 1
+                reward = 0
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+
+        elif action == 'surrender' and len(self.player_hands_real) == 1 and len(self.player_hands_real[0]) == 2:
+            self.surrenders += 1
+            reward = -0.5
+            done = True
+            return self.get_state(), reward, done
+
+        elif action == 'insurance':
+            if self.dealer_hand_real[0][0] == 'ace':
+                dealer_value = self.calculate_hand_value(self.dealer_hand_real)
+                if dealer_value == 21:
+                    self.insurance_wins += 1
+                    reward = 1
+                else:
+                    self.insurance_losses += 1
+                    reward = -0.5
+
+                done = False
+                return self.get_state(), reward, done
+
+        elif action == 'hit':
             self.hits += 1
             card, predicted_card = self.deal_card()
             self.player_hands_real[self.active_hand].append(card)
@@ -1258,7 +1506,7 @@ class BlackjackEnvironment:
                     done = False
 
                 return self.get_state(), reward, done
-            if player_value == 21:
+            elif player_value == 21:
                 self.blackjack_wins += 1
                 reward = 1.5
                 if self.active_hand == len(self.player_hands) - 1:
@@ -1335,12 +1583,20 @@ class QLearningAgent:
 
     def choose_action(self, state):
         if np.random.random() < self.epsilon:
-            available_actions = self.actions if state[4] else [a for a in self.actions if a != 'split']
+            available_actions = self.actions if state[6] else [a for a in self.actions if a != 'split']
+            available_actions = available_actions if state[5] else [a for a in self.actions if a != 'surrender']
+            available_actions = available_actions if state[4] else [a for a in self.actions if a != 'insurance']
             action = np.random.choice(available_actions)
         else:
             q_values = self.q_table[state]
-            if not state[4]:
+            if not state[6]:
                 self.q_table[state][self.actions.index('split')] = -float('inf')
+
+            if not state[5]:
+                self.q_table[state][self.actions.index('surrender')] = -float('inf')
+
+            if not state[4]:
+                self.q_table[state][self.actions.index('insurance')] = -float('inf')
 
             action = self.actions[np.argmax(q_values)]
 
@@ -1348,11 +1604,23 @@ class QLearningAgent:
         return action
 
     def update_q_value(self, state, action, reward, next_state):
-        if not state[4]:
+        if not state[6]:
             self.q_table[state][self.actions.index('split')] = -float('inf')
 
-        if not next_state[4]:
+        if not next_state[6]:
             self.q_table[next_state][self.actions.index('split')] = -float('inf')
+
+        if not state[5]:
+            self.q_table[state][self.actions.index('surrender')] = -float('inf')
+
+        if not next_state[5]:
+            self.q_table[next_state][self.actions.index('surrender')] = -float('inf')
+
+        if not state[4]:
+            self.q_table[state][self.actions.index('insurance')] = -float('inf')
+
+        if not next_state[4]:
+            self.q_table[next_state][self.actions.index('insurance')] = -float('inf')
 
         action_idx = self.actions.index(action)
         best_next_action = np.argmax(self.q_table[next_state])
@@ -1494,30 +1762,18 @@ class BlackjackRL:
     def probabilities(self, probabilities):
         self._probabilities = probabilities
 
-    def load_cnn_model(self, use_kan: bool = True):
+    def load_cnn_model(self, use_kan: bool = False):
         input_shape = (224, 224, 3)
         num_classes = 53  # 53 classes for 53 cards
 
-        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
-            MaxPooling2D((2, 2)),
-            Conv2D(64, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Conv2D(128, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Flatten(),
-            Dense(512, activation='relu'),
-            Dropout(0.5),
-            Dense(num_classes, activation='softmax')
-        ])
-
+        model = KANCNN(input_shape, num_classes) if use_kan else CNN(input_shape, num_classes)
         model.compile(
             optimizer='adam',
             loss='categorical_crossentropy',
             metrics=['accuracy']
         )
 
-        model.load_weights(self.cnn_model_path)  # Load your trained model weights
+        model.load_weights(self.cnn_model_path)
         return model
 
     def save_rl_model(self):
@@ -1588,6 +1844,8 @@ class BlackjackRL:
         win_data = {
             "Regular Wins": self.environment.regular_wins,
             "Blackjack Wins": self.environment.blackjack_wins,
+            "Insurance Wins": self.environment.insurance_wins,
+            "Insurance Losses": self.environment.insurance_losses,
             "Losses": self.environment.losses,
             "Draws": self.environment.draws
         }
@@ -1612,8 +1870,14 @@ class BlackjackRL:
         # Update Q-values plot
         state = self.environment.get_state()
         q_values = self.agent.q_table[state]
-        if not state[4]:
+        if not state[6]:
             q_values[self.agent.actions.index('split')] = 0
+
+        if not state[5]:
+            q_values[self.agent.actions.index('surrender')] = 0
+
+        if not state[4]:
+            q_values[self.agent.actions.index('insurance')] = 0
 
         self.q_values_ax.clear()
         self.q_values_ax.bar(self.agent.actions, q_values)
@@ -1724,23 +1988,45 @@ class BlackjackRL:
         self.root.mainloop()
 
 
-class DQN(nn.Module):
+class DQN(tf.keras.Model):
     def __init__(self, state_size, action_size):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, action_size)
+        super().__init__()
+        self.fc1 = tf.keras.layers.Dense(state_size)
+        self.bn1 = tf.keras.layers.BatchNormalization()
+        self.act1 = tf.keras.layers.LeakyReLU(alpha=0.01)
 
-    def forward(self, state):
-        x = torch.relu(self.fc1(state))
-        x = torch.relu(self.fc2(x))
+        self.fc2 = tf.keras.layers.Dense(128)
+        self.bn2 = tf.keras.layers.BatchNormalization()
+        self.act2 = tf.keras.layers.LeakyReLU(alpha=0.01)
+
+        self.fc3 = tf.keras.layers.Dense(64)
+        self.bn3 = tf.keras.layers.BatchNormalization()
+        self.act3 = tf.keras.layers.LeakyReLU(alpha=0.01)
+
+        self.dropout = tf.keras.layers.Dropout(0.5)
+        self.fc4 = tf.keras.layers.Dense(action_size)
+
+    def __call__(self, state):
+        x = self.fc1(state)
+        x = self.bn1(x)
+        x = self.act1(x)
+
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.act2(x)
+
         x = self.fc3(x)
+        x = self.bn3(x)
+        x = self.act3(x)
+
+        x = self.dropout(x)
+        x = self.fc4(x)
         return x
 
 
 class DQNAgent:
     def __init__(self, state_size, action_space, gamma=0.99, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.995,
-                 learning_rate=0.001, batch_size=32, target_update_freq=10):
+                 learning_rate=0.001, batch_size=128, target_update_freq=10):
         self.state_size = state_size
         self.action_size = len(action_space)
         self.action_space = action_space
@@ -1751,15 +2037,30 @@ class DQNAgent:
         self.epsilon_decay = epsilon_decay
         self.learning_rate = learning_rate
         self.batch_size = batch_size
-        self.model = DQN(state_size, self.action_size)
-        self.target_model = DQN(state_size, self.action_size)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        self.criterion = nn.MSELoss()
+
+        self.lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+            initial_learning_rate=self.learning_rate,
+            decay_steps=10000,
+            decay_rate=0.96,
+            staircase=False)
+
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr_schedule)
+        self.criterion = tf.keras.losses.MeanSquaredError()
+        self.model = self.create_model()
+        self.target_model = self.create_model()
         self.rewards = []
+        self.losses = []
+        self.learning_rates = []
         self.action_counts = defaultdict(int)
         self.target_update_freq = target_update_freq
         self.episode_count = 0
+        self.training_step = 0
         self.update_target_network()
+
+    def create_model(self):
+        model = DQN(self.state_size, self.action_size)
+        model.compile(optimizer=self.optimizer)
+        return model
 
     def remember(self, state, action, reward, next_state, done):
         action_idx = self.action_space.index(action)
@@ -1768,52 +2069,73 @@ class DQNAgent:
     def act(self, state):
         if np.random.rand() <= self.epsilon:
             available_actions = self.action_space if state[-1] else [a for a in self.action_space if a != 'split']
+            available_actions = available_actions if state[-2] else [a for a in self.action_space if a != 'surrender']
+            available_actions = available_actions if state[-3] else [a for a in self.action_space if a != 'insurance']
             chosen_action = random.choice(available_actions)
             action_idx = self.action_space.index(chosen_action)
             self.action_counts[self.action_space[action_idx]] += 1
             return chosen_action
 
-        state = torch.FloatTensor(state)
-        act_values = self.model(state)
-        if not state[-1]:
-            act_values[self.action_space.index('split')] = -float('inf')
+        state = tf.convert_to_tensor([state], dtype=tf.float32)
+        act_values = self.model(state)[0]
+        if not state[0][-1]:
+            act_values = tf.tensor_scatter_nd_update(act_values, [[self.action_space.index('split')]], [-float('inf')])
 
-        action_idx = torch.argmax(act_values).item()
+        if not state[0][-2]:
+            act_values = tf.tensor_scatter_nd_update(act_values, [[self.action_space.index('surrender')]], [-float('inf')])
+
+        if not state[0][-3]:
+            act_values = tf.tensor_scatter_nd_update(act_values, [[self.action_space.index('insurance')]], [-float('inf')])
+
+        action_idx = tf.argmax(act_values).numpy()
         self.action_counts[self.action_space[action_idx]] += 1
         return self.action_space[action_idx]
 
     def replay(self):
         if len(self.memory) < self.batch_size:
             return
+
         minibatch = random.sample(self.memory, self.batch_size)
+        losses = []
+        learning_rates = []
         for state, action_idx, reward, next_state, done in minibatch:
             target = reward
             if not done:
-                next_state = torch.FloatTensor(next_state)
-                target += self.gamma * torch.max(self.target_model(next_state)).item()
-            state = torch.FloatTensor(state)
-            target_f = self.model(state).detach().clone()
-            target_f[action_idx] = target
-            self.optimizer.zero_grad()
-            loss = self.criterion(self.model(state), target_f)
-            loss.backward()
-            self.optimizer.step()
+                next_state = tf.convert_to_tensor([next_state], dtype=tf.float32)
+                target += self.gamma * tf.reduce_max(self.target_model(next_state)[0]).numpy()
+
+            state = tf.convert_to_tensor([state], dtype=tf.float32)
+            target_f = self.model(state).numpy()
+            target_f[0][action_idx] = target
+            with tf.GradientTape() as tape:
+                predictions = self.model(state)
+                loss = self.criterion(target_f, predictions)
+                losses.append(np.mean(loss.numpy()))
+
+            learning_rates.append(self.lr_schedule(self.training_step).numpy())
+            grads = tape.gradient(loss, self.model.trainable_variables)
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+            self.training_step += 1
+
+        self.losses.append(np.mean(losses))
+        self.learning_rates.append(np.mean(learning_rates))
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+
         self.update_target_network_periodically()
 
     def update_target_network(self):
-        self.target_model.load_state_dict(self.model.state_dict())
+        self.target_model.set_weights(self.model.get_weights())
 
     def update_target_network_periodically(self):
         if self.episode_count % self.target_update_freq == 0:
             self.update_target_network()
 
     def load_model(self, name):
-        self.model.load_state_dict(torch.load(name))
+        self.model.load_weights(name)
 
     def save_model(self, name):
-        torch.save(self.model.state_dict(), name)
+        self.model.save_weights(name)
 
 
 class DQNBlackjackEnvironment:
@@ -1845,17 +2167,22 @@ class DQNBlackjackEnvironment:
 
         self._blackjack_wins = 0
         self._regular_wins = 0
+        self._insurance_wins = 0
+        self._insurance_losses = 0
         self._losses = 0
         self._draws = 0
         self._hits = 0
         self._splits = 0
         self._stands = 0
+        self._doubles = 0
+        self._surrenders = 0
         self._hand_count = 0
         self._active_hand = 0
         self._dealer_hand = []
         self._player_hands = [[]]
         self._dealer_hand_real = []
         self._player_hands_real = [[]]
+        self._probabilities = {'High': [5 / 13], 'Low': [5 / 13], 'Neutral': [3 / 13]}
         self.reset_deck()
 
     @property
@@ -1873,6 +2200,22 @@ class DQNBlackjackEnvironment:
     @regular_wins.setter
     def regular_wins(self, regular_wins):
         self._regular_wins = regular_wins
+
+    @property
+    def insurance_wins(self):
+        return self._insurance_wins
+
+    @insurance_wins.setter
+    def insurance_wins(self, insurance_wins):
+        self._insurance_wins = insurance_wins
+
+    @property
+    def insurance_losses(self):
+        return self._insurance_losses
+
+    @insurance_losses.setter
+    def insurance_losses(self, insurance_losses):
+        self._insurance_losses = insurance_losses
 
     @property
     def losses(self):
@@ -1913,6 +2256,22 @@ class DQNBlackjackEnvironment:
     @stands.setter
     def stands(self, stands):
         self._stands = stands
+
+    @property
+    def doubles(self):
+        return self._doubles
+
+    @doubles.setter
+    def doubles(self, doubles):
+        self._doubles = doubles
+
+    @property
+    def surrenders(self):
+        return self._surrenders
+
+    @surrenders.setter
+    def surrenders(self, surrenders):
+        self._surrenders = surrenders
 
     @property
     def hand_count(self):
@@ -1962,30 +2321,26 @@ class DQNBlackjackEnvironment:
     def player_hands_real(self, player_hands_real):
         self._player_hands_real = player_hands_real
 
-    def load_model(self, use_kan: bool = True):
+    @property
+    def probabilities(self):
+        return self._probabilities
+
+    @probabilities.setter
+    def probabilities(self, probabilities):
+        self._probabilities = probabilities
+
+    def load_model(self, use_kan: bool = False):
         input_shape = (224, 224, 3)
         num_classes = 53  # 53 classes for 53 cards
 
-        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
-            MaxPooling2D((2, 2)),
-            Conv2D(64, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Conv2D(128, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Flatten(),
-            Dense(512, activation='relu'),
-            Dropout(0.5),
-            Dense(num_classes, activation='softmax')
-        ])
-
+        model = KANCNN(input_shape, num_classes) if use_kan else CNN(input_shape, num_classes)
         model.compile(
             optimizer='adam',
             loss='categorical_crossentropy',
             metrics=['accuracy']
         )
 
-        model.load_weights(self.model_path)  # Load your trained model weights
+        model.load_weights(self.model_path)
         return model
 
     def create_deck(self):
@@ -2054,7 +2409,7 @@ class DQNBlackjackEnvironment:
         self.probabilities = {'High': [5 / 13], 'Low': [5 / 13], 'Neutral': [3 / 13]}
 
     def one_hot_encode_rank(self, rank):
-        ranks = ['two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'jack', 'queen', 'king', 'ace']
+        ranks = [*self.ranks.keys()]
         encoding = [0] * len(ranks)
         encoding[ranks.index(rank)] = 1
         return encoding
@@ -2063,15 +2418,93 @@ class DQNBlackjackEnvironment:
         player_hand_value = self.calculate_hand_value(self.player_hands[self.active_hand])
         dealer_visible_card = self.one_hot_encode_rank(self.dealer_hand[0][0])
         usable_a = self.usable_ace(self.player_hands[self.active_hand])
-        return [player_hand_value] + dealer_visible_card + [usable_a] + [self.probabilities['High'][-1], self.probabilities['Low'][-1], self.probabilities['Neutral'][-1], self.can_split()]
+        return [player_hand_value] + dealer_visible_card + [usable_a] + [self.probabilities['High'][-1], self.probabilities['Low'][-1], self.probabilities['Neutral'][-1], self.can_insure(), self.can_surrender(), self.can_split()]
+
+    def can_insure(self):
+        return self.dealer_hand[0][0] == 'ace'
+
+    def can_surrender(self):
+        return len(self.player_hands) == 1 and len(self.player_hands[0]) == 2
 
     def can_split(self):
-        return len(self.player_hands_real[self.active_hand]) == 2 and self.player_hands_real[self.active_hand][0][0] == self.player_hands_real[self.active_hand][1][0]
+        return len(self.player_hands[self.active_hand]) == 2 and self.player_hands[self.active_hand][0][0] == self.player_hands[self.active_hand][1][0]
 
     def usable_ace(self, hand):
         return 1 in [card[0] == 'ace' for card in hand] and self.calculate_hand_value(hand) + 10 <= 21
 
     def step(self, action):
+        if action == 'double':
+            self.doubles += 1
+            card, predicted_card = self.deal_card()
+            self.player_hands_real[self.active_hand].append(card)
+            self.player_hands[self.active_hand].append(predicted_card)
+            player_value = self.calculate_hand_value(self.player_hands_real[self.active_hand])
+            dealer_value = self.calculate_hand_value(self.dealer_hand_real)
+            if player_value > 21:
+                self.losses += 1
+                reward = -2
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+            elif player_value == 21:
+                self.blackjack_wins += 1
+                reward = 3
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+            elif player_value > dealer_value or dealer_value > 21:
+                self.regular_wins += 1
+                reward = 2
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+            elif player_value < dealer_value <= 21:
+                self.losses += 1
+                reward = -2
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+            else:
+                self.draws += 1
+                reward = 0
+                if self.active_hand == len(self.player_hands) - 1:
+                    done = True
+                else:
+                    done = False
+
+                return self.get_state(), reward, done
+
+        elif action == 'surrender' and len(self.player_hands_real) == 1 and len(self.player_hands_real[0]) == 2:
+            self.surrenders += 1
+            reward = -0.5
+            done = True
+            return self.get_state(), reward, done
+
+        elif action == 'insurance':
+            if self.dealer_hand_real[0][0] == 'ace':
+                dealer_value = self.calculate_hand_value(self.dealer_hand_real)
+                if dealer_value == 21:
+                    self.insurance_wins += 1
+                    reward = 1
+                else:
+                    self.insurance_losses += 1
+                    reward = -0.5
+
+                done = False
+                return self.get_state(), reward, done
+
         if action == 'hit':
             self.hits += 1
             card, predicted_card = self.deal_card()
@@ -2081,19 +2514,27 @@ class DQNBlackjackEnvironment:
             if player_value > 21:
                 self.losses += 1
                 reward = -1
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
+                done = True
+                if self.active_hand < len(self.player_hands):
+                    self.active_hand += 1
+                    if self.active_hand < len(self.player_hands):
+                        done = False
+                    else:
+                        done = True
+                        self.active_hand -= 1
 
                 return self.get_state(), reward, done
             elif player_value == 21:
                 self.blackjack_wins += 1
                 reward = 1.5
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
+                done = True
+                if self.active_hand < len(self.player_hands):
+                    self.active_hand += 1
+                    if self.active_hand < len(self.player_hands):
+                        done = False
+                    else:
+                        done = True
+                        self.active_hand -= 1
 
                 return self.get_state(), reward, done
             else:
@@ -2101,11 +2542,14 @@ class DQNBlackjackEnvironment:
 
         elif action == 'stand':
             self.stands += 1
-            if self.active_hand < len(self.player_hands) - 1:
+            if self.active_hand < len(self.player_hands):
                 self.active_hand += 1
                 reward = 0
-                done = False
-                return self.get_state(), reward, done
+                if self.active_hand < len(self.player_hands):
+                    done = False
+                    return self.get_state(), reward, done
+                else:
+                    self.active_hand -= 1
 
             while self.calculate_hand_value(self.dealer_hand_real) < 17:
                 card, predicted_card = self.deal_card()
@@ -2165,18 +2609,14 @@ class DQNBlackjackRL:
         self.game_log = []
         self.training = False
 
-        # Get screen width and height
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
         # Set window size as a percentage of screen size
-        window_width = int(screen_width * 0.95)
-        window_height = int(screen_height * 0.9)
-        self.root.geometry(f"{window_width}x{window_height}")
+        self.window_width = int(self.root.winfo_screenwidth() * 0.95)
+        self.window_height = int(self.root.winfo_screenheight() * 0.9)
+        self.root.geometry(f"{self.window_width}x{self.window_height}")
 
         # Calculate padding as percentages of screen dimensions
-        self.padx = int(screen_width * 0.01)
-        self.pady = int(screen_height * 0.01)
+        self.padx = int(self.window_width * 0.01)
+        self.pady = int(self.window_height * 0.01)
         self.num_columns = 4
 
         # Load the trained model
@@ -2184,41 +2624,48 @@ class DQNBlackjackRL:
         self.cnn_model = self.load_cnn_model()
         self.card_counter = CardCounter(model=self.cnn_model)
 
-        # Create frames
-        self.game_frame = tk.Frame(self.root)
-        self.game_frame.pack(side=tk.LEFT, padx=self.padx, pady=self.pady, expand=True, fill='both')
+        # Create main frames
+        self.main_frame = tk.Frame(self.root)
+        self.main_frame.pack(side=tk.LEFT, padx=self.padx, pady=self.pady, expand=True, fill='both')
+
         self.stats_frame = tk.Frame(self.root)
         self.stats_frame.pack(side=tk.RIGHT, padx=self.padx, pady=self.pady, expand=True, fill='both')
 
+        self.game_frame = tk.Frame(self.main_frame)
+        self.game_frame.pack(side=tk.TOP, expand=True, fill='both')
+
+        # Store initial size of the game frame
+        self.initial_game_frame_size = (self.window_width // 2, self.window_height)
+
         # Create game widgets
-        self.player_label = tk.Label(self.game_frame, text="Player's Hand")
-        self.player_label.grid(row=0, column=0, columnspan=self.num_columns)
-        self.player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
-        for idx, frame in enumerate(self.player_frames):
+        self._player_label = tk.Label(self.game_frame, text="Player's Hand")
+        self._player_label.grid(row=0, column=0, columnspan=self.num_columns)
+        self._player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
+        for idx, frame in enumerate(self._player_frames):
             frame.grid(row=1, column=idx, padx=self.padx, pady=self.pady, sticky='nsew')
 
-        self.dealer_label = tk.Label(self.game_frame, text="Dealer's Hand")
-        self.dealer_label.grid(row=2, column=0, pady=self.pady)
-        self.dealer_frame = tk.Frame(self.game_frame)
-        self.dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady, sticky='nsew')
+        self._dealer_label = tk.Label(self.game_frame, text="Dealer's Hand")
+        self._dealer_label.grid(row=2, column=0, pady=self.pady)
+        self._dealer_frame = tk.Frame(self.game_frame)
+        self._dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady, sticky='nsew')
 
-        self.start_button = tk.Button(self.game_frame, text="Start Training", command=self.start_training)
-        self.start_button.grid(row=4, column=0, padx=self.padx, pady=self.pady)
-        self.stop_button = tk.Button(self.game_frame, text="Stop Training", command=self.stop_training,
+        self._start_button = tk.Button(self.game_frame, text="Start Training", command=self.start_training)
+        self._start_button.grid(row=4, column=0, padx=self.padx, pady=self.pady)
+        self._stop_button = tk.Button(self.game_frame, text="Stop Training", command=self.stop_training,
                                      state=tk.DISABLED)
-        self.stop_button.grid(row=4, column=1, padx=self.padx, pady=self.pady)
-        self.save_button = tk.Button(self.game_frame, text="Save Model", command=self.save_rl_model)
-        self.save_button.grid(row=5, column=0, padx=self.padx, pady=self.pady)
-        self.load_button = tk.Button(self.game_frame, text="Load Model", command=self.load_rl_model)
-        self.load_button.grid(row=5, column=1, padx=self.padx, pady=self.pady)
+        self._stop_button.grid(row=4, column=1, padx=self.padx, pady=self.pady)
+        self._save_button = tk.Button(self.game_frame, text="Save Model", command=self.save_rl_model)
+        self._save_button.grid(row=5, column=0, padx=self.padx, pady=self.pady)
+        self._load_button = tk.Button(self.game_frame, text="Load Model", command=self.load_rl_model)
+        self._load_button.grid(row=5, column=1, padx=self.padx, pady=self.pady)
 
-        self.test_button = tk.Button(self.game_frame, text="Test Agent",
+        self._test_button = tk.Button(self.game_frame, text="Test Agent",
                                      command=lambda: self.test_agent(games=test_episodes), state=tk.DISABLED)
-        self.test_button.grid(row=6, column=0, columnspan=self.num_columns, pady=self.pady)
+        self._test_button.grid(row=6, column=0, columnspan=self.num_columns, pady=self.pady)
 
         # Create stats widgets with adjusted sizes
-        fig_width = window_width / 3 / 100
-        fig_height = window_height / 3 / 100
+        fig_width = self.window_width / 4 / 100
+        fig_height = self.window_height / 4.5 / 100
 
         # Create stats widgets
         self.cumulative_rewards_fig, self.cumulative_rewards_ax = plt.subplots(figsize=(fig_width, fig_height))
@@ -2245,10 +2692,18 @@ class DQNBlackjackRL:
         self.action_counts_canvas = FigureCanvasTkAgg(self.action_counts_fig, master=self.stats_frame)
         self.action_counts_canvas.get_tk_widget().grid(row=2, column=1)
 
+        self.loss_fig, self.loss_ax = plt.subplots(figsize=(fig_width, fig_height))
+        self.loss_canvas = FigureCanvasTkAgg(self.loss_fig, master=self.stats_frame)
+        self.loss_canvas.get_tk_widget().grid(row=3, column=0)
+
+        self.learning_rate_fig, self.learning_rate_ax = plt.subplots(figsize=(fig_width, fig_height))
+        self.learning_rate_canvas = FigureCanvasTkAgg(self.learning_rate_fig, master=self.stats_frame)
+        self.learning_rate_canvas.get_tk_widget().grid(row=3, column=1)
+
         # Create a scrollable text widget for logs
-        self.log_frame = tk.Frame(self.game_frame)
-        self.log_frame.grid(row=7, column=0, columnspan=2, sticky='nsew')
-        self.log_text = tk.Text(self.log_frame, wrap=tk.WORD, state=tk.NORMAL, width=80, height=10)
+        self.log_frame = tk.Frame(self.main_frame)
+        self.log_frame.pack(side=tk.BOTTOM, fill='both')
+        self.log_text = tk.Text(self.log_frame, wrap=tk.WORD, state=tk.NORMAL, width=80, height=25)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.log_scrollbar = ttk.Scrollbar(self.log_frame, command=self.log_text.yview)
         self.log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -2264,22 +2719,111 @@ class DQNBlackjackRL:
     def probabilities(self, probabilities):
         self._probabilities = probabilities
 
-    def load_cnn_model(self, use_kan: bool = True):
+    @property
+    def player_label(self):
+        return self._player_label
+
+    @player_label.setter
+    def player_label(self, player_label):
+        self._player_label = player_label
+
+    @property
+    def player_frames(self):
+        return self._player_frames
+
+    @player_frames.setter
+    def player_frames(self, player_frames):
+        self._player_frames = player_frames
+
+    @property
+    def dealer_label(self):
+        return self._dealer_label
+
+    @dealer_label.setter
+    def dealer_label(self, dealer_label):
+        self._dealer_label = dealer_label
+
+    @property
+    def dealer_frame(self):
+        return self._dealer_frame
+
+    @dealer_frame.setter
+    def dealer_frame(self, dealer_frame):
+        self._dealer_frame = dealer_frame
+
+    @property
+    def start_button(self):
+        return self._start_button
+
+    @start_button.setter
+    def start_button(self, start_button):
+        self._start_button = start_button
+
+    @property
+    def stop_button(self):
+        return self._stop_button
+
+    @stop_button.setter
+    def stop_button(self, stop_button):
+        self._stop_button = stop_button
+
+    @property
+    def save_button(self):
+        return self._save_button
+
+    @save_button.setter
+    def save_button(self, save_button):
+        self._save_button = save_button
+
+    @property
+    def load_button(self):
+        return self._load_button
+
+    @load_button.setter
+    def load_button(self, load_button):
+        self._load_button = load_button
+
+    @property
+    def test_button(self):
+        return self._test_button
+
+    @test_button.setter
+    def test_button(self, test_button):
+        self._test_button = test_button
+
+    def reinitialize_game_frame(self):
+        # Create game widgets
+        self.player_label = tk.Label(self.game_frame, text="Player's Hand")
+        self.player_label.grid(row=0, column=0, columnspan=self.num_columns)
+        self.player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
+        for idx, frame in enumerate(self.player_frames):
+            frame.grid(row=1, column=idx, padx=self.padx, pady=self.pady, sticky='nsew')
+
+        self.dealer_label = tk.Label(self.game_frame, text="Dealer's Hand")
+        self.dealer_label.grid(row=2, column=0, pady=self.pady)
+        self.dealer_frame = tk.Frame(self.game_frame)
+        self.dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady,
+                               sticky='nsew')
+
+        self.start_button = tk.Button(self.game_frame, text="Start Training", command=self.start_training)
+        self.start_button.grid(row=4, column=0, padx=self.padx, pady=self.pady)
+        self.stop_button = tk.Button(self.game_frame, text="Stop Training", command=self.stop_training,
+                                     state=tk.DISABLED)
+        self.stop_button.grid(row=4, column=1, padx=self.padx, pady=self.pady)
+        self.save_button = tk.Button(self.game_frame, text="Save Model", command=self.save_rl_model)
+        self.save_button.grid(row=5, column=0, padx=self.padx, pady=self.pady)
+        self.load_button = tk.Button(self.game_frame, text="Load Model", command=self.load_rl_model)
+        self.load_button.grid(row=5, column=1, padx=self.padx, pady=self.pady)
+
+        self.test_button = tk.Button(self.game_frame, text="Test Agent",
+                                     command=lambda: self.test_agent(games=self.test_episodes), state=tk.DISABLED)
+        self.test_button.grid(row=6, column=0, columnspan=self.num_columns, pady=self.pady)
+
+    def load_cnn_model(self, use_kan: bool = False):
         input_shape = (224, 224, 3)
         num_classes = 53  # 53 classes for 53 cards
 
-        model = KANCNN(input_shape, num_classes) if use_kan else Sequential([
-            Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
-            MaxPooling2D((2, 2)),
-            Conv2D(64, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Conv2D(128, (3, 3), activation='relu'),
-            MaxPooling2D((2, 2)),
-            Flatten(),
-            Dense(512, activation='relu'),
-            Dropout(0.5),
-            Dense(num_classes, activation='softmax')
-        ])
+        model = KANCNN(input_shape, num_classes) if use_kan else CNN(input_shape, num_classes)
 
         model.compile(
             optimizer='adam',
@@ -2330,6 +2874,8 @@ class DQNBlackjackRL:
         win_data = {
             "Regular Wins": self.environment.regular_wins,
             "Blackjack Wins": self.environment.blackjack_wins,
+            "Insurance Wins": self.environment.insurance_wins,
+            "Insurance Losses": self.environment.insurance_losses,
             "Losses": self.environment.losses,
             "Draws": self.environment.draws
         }
@@ -2352,10 +2898,10 @@ class DQNBlackjackRL:
         self.prob_canvas.draw()
 
         # Update Q-values plot
-        state = self.environment.get_state()
-        q_values = self.agent.model(torch.FloatTensor(state)).detach().numpy()
-        if not state[-1]:
-            q_values[self.agent.action_space.index('split')] = 0
+        state = tf.convert_to_tensor([self.environment.get_state()], dtype=tf.float32)
+        q_values = self.agent.model(state)[0]
+        if not state[0][-1]:
+            q_values = tf.tensor_scatter_nd_update(q_values, [[self.agent.action_space.index('split')]], [-float('inf')])
 
         self.q_values_ax.clear()
         self.q_values_ax.bar(self.agent.action_space, q_values)
@@ -2373,6 +2919,26 @@ class DQNBlackjackRL:
         self.action_counts_ax.set_ylabel('Counts')
         self.action_counts_ax.set_title('Action Selection Frequency')
         self.action_counts_canvas.draw()
+
+        # Update loss plot
+        losses = self.agent.losses
+        self.loss_ax.clear()
+        self.loss_ax.plot(range(1, len(losses) + 1), losses, label='Loss')
+        self.loss_ax.set_xlabel('Episode')
+        self.loss_ax.set_ylabel('Loss')
+        self.loss_ax.set_title('Loss Over Time')
+        self.loss_ax.legend()
+        self.loss_canvas.draw()
+
+        # Update learning rate plot
+        learning_rates = self.agent.learning_rates
+        self.learning_rate_ax.clear()
+        self.learning_rate_ax.plot(range(1, len(learning_rates) + 1), learning_rates, label='Learning Rate')
+        self.learning_rate_ax.set_xlabel('Episode')
+        self.learning_rate_ax.set_ylabel('Learning Rate')
+        self.learning_rate_ax.set_title('Learning Rate Over Time')
+        self.learning_rate_ax.legend()
+        self.learning_rate_canvas.draw()
 
     def log_message(self, message):
         message = f'Episode {self.episode_count}: {message}'
@@ -2400,14 +2966,11 @@ class DQNBlackjackRL:
         self.clear_frames(self.player_frames)
         self.clear_frames([self.dealer_frame])
 
-        self.player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
-        for idx, frame in enumerate(self.player_frames):
-            frame.grid(row=1, column=idx, padx=self.padx, pady=self.pady, sticky='nsew')
+        for widget in self.game_frame.winfo_children():
+            widget.destroy()
 
-        self.dealer_frame = tk.Frame(self.game_frame)
-        self.dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady,
-                               sticky='nsew')
-
+        # Reset the size of the game_frame
+        self.reinitialize_game_frame()
         self.update_stats()
 
     def clear_frames(self, frames):
@@ -2516,13 +3079,14 @@ class DQNBlackjackRL:
 
 
 if __name__ == '__main__':
-    epochs = 5
+    epochs = 25
     model_path = f'./models/{epochs}_model.h5'
 
     # Train the CNN model
-    model = train_model(epochs=epochs)
+    model1 = train_model(epochs=epochs)
+    model = train_model(epochs=epochs, use_kan=True)
 
-    # Make predictions
+    # # Make predictions
     image_paths = [r'.\data\test\ace of clubs\1.jpg', r'.\data\test\nine of clubs\1.jpg',
                    r'.\data\test\six of clubs\1.jpg', r'.\data\test\king of hearts\1.jpg']
 
@@ -2544,15 +3108,15 @@ if __name__ == '__main__':
 
     # Create a Q-Learning Reinforcement Learning model to learn to play blackjack
     env = BlackjackEnvironment(model_path)
-    actions = ['hit', 'stand', 'split']
+    actions = ['hit', 'stand', 'insurance', 'surrender', 'split']
     agent = QLearningAgent(action_space=actions)
     root = tk.Tk()
     app = BlackjackRL(
         root=root,
         agent=agent,
         environment=env,
-        train_episodes=1000,
-        test_episodes=100,
+        train_episodes=10000,
+        test_episodes=1000,
         cnn_model_path=model_path
     )
 
@@ -2564,10 +3128,10 @@ if __name__ == '__main__':
     dealer_visible_card_size = 13  # One-hot encoding of 13 ranks
     usable_ace_size = 1
     probabilities_size = 3
+    insurance_possibility_indicator = 1
+    surrender_possibility_indicator = 1
     split_possibility_indicator = 1
-
-    state_size = player_hand_value_size + dealer_visible_card_size + usable_ace_size + probabilities_size + split_possibility_indicator
-    actions = ['hit', 'stand', 'split']
+    state_size = player_hand_value_size + dealer_visible_card_size + usable_ace_size + probabilities_size + insurance_possibility_indicator + surrender_possibility_indicator + split_possibility_indicator
 
     dqn_env = DQNBlackjackEnvironment(model_path=model_path)
     dqn_agent = DQNAgent(state_size=state_size, action_space=actions)
@@ -2578,8 +3142,8 @@ if __name__ == '__main__':
         root=dqn_root,
         agent=dqn_agent,
         environment=dqn_env,
-        train_episodes=1000,
-        test_episodes=100,
+        train_episodes=10000,
+        test_episodes=1000,
         cnn_model_path=model_path
     )
 
