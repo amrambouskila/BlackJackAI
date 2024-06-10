@@ -55,7 +55,7 @@ class KANConv2D(Layer):
 
 
 def residual_block(x, filters, kernel_size):
-    shortcut = x
+    shortcut = Conv2D(filters, (1, 1), padding='same')(x)
     x = KANConv2D(filters, kernel_size)(x)
     x = KANConv2D(filters, kernel_size)(x)
     x = Add()([x, shortcut])
@@ -242,13 +242,17 @@ def train_model(data_path: str = './data', epochs: int = 100, total_patience: in
         shuffle=False
     )
 
-    model_path = f'./models/{epochs}_model.h5'
+    if use_kan:
+        model_path = f'./models/{epochs}_KAN_model.h5'
+    else:
+        model_path = f'./models/{epochs}_model.h5'
+
     input_shape = (224, 224, 3)
     num_classes = 53  # 53 classes for 53 cards
     model = KANCNN(input_shape, num_classes) if use_kan else CNN(input_shape, num_classes)
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
     if Path(model_path).exists():
-        model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
         model.load_weights(model_path)
         return model
 
@@ -490,7 +494,8 @@ class BlackjackGame:
         # Initialize game variables
         self.starting_bankroll = bankroll
         self._bankroll = bankroll
-        self._cost = cost
+        self.cost = cost
+        self._current_cost = cost
         self._blackjack_wins = 0
         self._regular_wins = 0
         self._losses = 0
@@ -502,6 +507,7 @@ class BlackjackGame:
         self._surrenders = 0
         self._insurance_wins = 0
         self._insurance_losses = 0
+        self._insurance_used = False
         self._hand_count = 0
         self._active_hand = 0
         self._dealer_hand = []
@@ -532,6 +538,7 @@ class BlackjackGame:
         self.dealer_label.pack()
         self.dealer_frame = tk.Frame(self.main_container)
         self.dealer_frame.pack()
+        self._placeholder_frame = None
 
         self.hit_button = tk.Button(self.main_container, text="Hit", command=self.hit)
         self.hit_button.pack(side=tk.LEFT)
@@ -578,6 +585,7 @@ class BlackjackGame:
         # Initialize data for plots
         self._returns = []
         self._average_returns = []
+        self._remaining_hands = {}
 
         # Initialize the animation
         self.ani = FuncAnimation(self.fig, self.update_plots, interval=1000)
@@ -591,12 +599,12 @@ class BlackjackGame:
         self._bankroll = bankroll
 
     @property
-    def cost(self):
-        return self._cost
+    def current_cost(self):
+        return self._current_cost
 
-    @cost.setter
-    def cost(self, cost):
-        self._cost = cost
+    @current_cost.setter
+    def current_cost(self, current_cost):
+        self._current_cost = current_cost
 
     @property
     def blackjack_wins(self):
@@ -687,6 +695,14 @@ class BlackjackGame:
         self._insurance_losses = insurance_losses
 
     @property
+    def insurance_used(self):
+        return self._insurance_used
+
+    @insurance_used.setter
+    def insurance_used(self, insurance_used):
+        self._insurance_used = insurance_used
+
+    @property
     def hand_count(self):
         return self._hand_count
 
@@ -744,6 +760,7 @@ class BlackjackGame:
 
     @property
     def available_rewards(self):
+        self._available_rewards = {'Blackjack': int(self.current_cost * 1.5), 'Regular': self.current_cost, 'Loss': -self.current_cost}
         return self._available_rewards
 
     @available_rewards.setter
@@ -766,6 +783,22 @@ class BlackjackGame:
     def average_returns(self, average_returns):
         self._average_returns = average_returns
 
+    @property
+    def placeholder_frame(self):
+        return self._placeholder_frame
+
+    @placeholder_frame.setter
+    def placeholder_frame(self, placeholder_frame):
+        self._placeholder_frame = placeholder_frame
+
+    @property
+    def remaining_hands(self):
+        return self._remaining_hands
+
+    @remaining_hands.setter
+    def remaining_hands(self, remaining_hands):
+        self._remaining_hands = remaining_hands
+
     def log_prefix(self, idx: int):
         return f'Hand {self.hand_count}: Active Hand {idx + 1} -'
 
@@ -786,7 +819,7 @@ class BlackjackGame:
     def create_deck(self):
         deck = [(rank, suit) for rank in self.ranks.keys() for suit in self.suits for _ in
                 range(self.card_counter.n_decks)]
-        # random.shuffle(deck)
+        random.shuffle(deck)
         return deck
 
     def display_hand(self, card, is_dealer):
@@ -819,7 +852,28 @@ class BlackjackGame:
 
         self.update_probabilities_label()
 
-    def deal_card(self, hand: list, is_dealer: bool = False):
+    def display_back(self):
+        img_path = f'./data/card back black.png'
+
+        if not os.path.exists(img_path):
+            print(f"Image path does not exist: {img_path}")
+            return
+
+        try:
+            img = Image.open(img_path)
+            img = img.resize((100, 150), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.card_images.append(photo)
+            self.placeholder_frame = tk.Frame(self.dealer_frame)
+            self.placeholder_frame.pack(side=tk.LEFT)
+            label = tk.Label(self.placeholder_frame, image=photo)
+            label.image = photo
+            label.pack()
+            tk.Label(self.placeholder_frame, text='').pack()
+        except Exception as e:
+            print(f"Failed to load image {img_path}: {e}")
+
+    def deal_card(self, hand: list, is_dealer: bool = False, show: bool = True):
         card = self.deck.pop()
         self.card_counter.total_cards -= 1
         if self.card_counter.total_cards == 0:
@@ -829,7 +883,11 @@ class BlackjackGame:
             self.card_images = []
 
         hand.append(card)
-        self.display_hand(card=card, is_dealer=is_dealer)
+
+        if show:
+            self.display_hand(card=card, is_dealer=is_dealer)
+        else:
+            self.display_back()
 
     def calculate_hand_value(self, hand):
         value = 0
@@ -924,13 +982,15 @@ class BlackjackGame:
 
     def start_game(self):
         self.hand_count += 1
+        self.insurance_used = False
         self.deal_card(self.player_hands[0])
         self.deal_card(self.dealer_hand, is_dealer=True)
         self.deal_card(self.player_hands[0])
-        self.deal_card(self.dealer_hand, is_dealer=True)
+        self.deal_card(self.dealer_hand, is_dealer=True, show=False)
+
+        self.remaining_hands[0] = self.player_hands[0]
 
         player_value = self.calculate_hand_value(self.player_hands[0])
-        dealer_value = self.calculate_hand_value(self.dealer_hand)
         if player_value == 21:
             reward = self.available_rewards["Blackjack"]
             self.blackjack_wins += 1
@@ -940,20 +1000,11 @@ class BlackjackGame:
             message = f"{self.log_prefix(0)} Blackjack! Player wins ${reward}!"
             self.log_message(message)
             self.reset_hand()
-        elif dealer_value == 21:
-            reward = self.available_rewards["Loss"]
-            self.losses += 1
-            self.update_game_label(reward)
-            self.returns.append(reward)
-            self.average_returns.append(sum(self.returns) / self.hand_count)
-            message = f"{self.log_prefix(0)} Dealer Hit Blackjack. Player Loses ${-reward}"
-            self.log_message(message)
-            self.reset_hand()
-        else:
-            self.update_game_label(0)
 
         # Enable the split button if the player has two cards of the same rank
         self.update_split_button_state()
+        self.update_surrender_button_state()
+        self.update_insurance_button_state()
 
     def update_split_button_state(self):
         can_split = any(len(hand) == 2 and hand[0][0] == hand[1][0] for hand in self.player_hands)
@@ -964,7 +1015,7 @@ class BlackjackGame:
         self.surrender_button.config(state=tk.NORMAL if can_surrender else tk.DISABLED)
 
     def update_insurance_button_state(self):
-        can_surrender = self.dealer_hand[0][0] == 'ace'
+        can_surrender = self.dealer_hand[0][0] == 'ace' and not self.insurance_used
         self.insurance_button.config(state=tk.NORMAL if can_surrender else tk.DISABLED)
 
     def split(self):
@@ -976,20 +1027,39 @@ class BlackjackGame:
             self.deal_card(new_hand)
             self.deal_card(self.player_hands[self.active_hand])
             self.player_hands.append(new_hand)
+            self.remaining_hands[self.active_hand] = self.player_hands[self.active_hand]
+            self.remaining_hands[len(self.player_hands) - 1] = new_hand
 
-        self.update_split_button_state()
         for frame in self.player_frames[1:]:
             frame.pack(side=tk.LEFT, padx=10)
 
+        for idx, hand in enumerate(self.player_hands):
+            if self.calculate_hand_value(hand) == 21:
+                self.blackjack_wins += 1
+                self.update_game_label(self.available_rewards["Blackjack"])
+                self.returns.append(self.available_rewards["Blackjack"])
+                self.average_returns.append(sum(self.returns) / self.hand_count)
+                message = f"{self.log_prefix(idx)} Blackjack! Player wins ${self.available_rewards['Blackjack']}!"
+                self.log_message(message)
+                if idx in self.remaining_hands:
+                    del self.remaining_hands[idx]
+
+        while self.active_hand < len(self.player_hands) and self.active_hand not in self.remaining_hands.keys():
+            self.active_hand += 1
+
+        self.highlight_active_hand()
         self.update_hand_display()
-        self.update_game_label(0)
         self.update_split_button_state()
+        self.update_surrender_button_state()
+        self.update_insurance_button_state()
 
     def highlight_active_hand(self):
         for idx, player_frame in enumerate(self.player_frames):
             player_frame.config(bg='lightblue' if self.active_hand == idx else 'SystemButtonFace')
 
         self.update_split_button_state()
+        self.update_surrender_button_state()
+        self.update_insurance_button_state()
 
     def update_hand_display(self):
         for player_frame in self.player_frames:
@@ -1019,11 +1089,34 @@ class BlackjackGame:
         # Implement double down logic
     def double(self):
         self.doubles += 1
-        self.hits -= 1
-        self.stands -= 1
-        self.cost *= 2
-        self.hit()
-        self.stand()
+        self.current_cost *= 2
+        self.deal_card(self.player_hands[self.active_hand])
+        player_value = self.calculate_hand_value(self.player_hands[self.active_hand])
+
+        if self.active_hand in self.remaining_hands.keys():
+            del self.remaining_hands[self.active_hand]
+
+        reset = False
+        if self.active_hand < len(self.player_hands) - 1:
+            self.active_hand += 1
+            self.highlight_active_hand()
+        else:
+            reset = True
+
+        if self.placeholder_frame:
+            self.placeholder_frame.destroy()
+            self.placeholder_frame = None
+
+        self.display_hand(self.dealer_hand[1], is_dealer=True)
+        while self.calculate_hand_value(self.dealer_hand) < 17:
+            self.deal_card(self.dealer_hand, is_dealer=True)
+
+        dealer_value = self.calculate_hand_value(self.dealer_hand)
+        self.compare_hands(player_value, dealer_value, self.active_hand)
+        self.current_cost = self.cost
+
+        if reset:
+            self.reset_hand()
 
     # Implement surrender logic
     def surrender(self):
@@ -1040,7 +1133,8 @@ class BlackjackGame:
 
     # Implement insurance logic
     def insurance(self):
-        if self.dealer_hand[0][0] == 'ace':
+        if self.dealer_hand[0][0] == 'ace' and not self.insurance_used:
+            self.insurance_used = True
             insurance_cost = self.cost / 2
             self.bankroll -= insurance_cost
             dealer_value = self.calculate_hand_value(self.dealer_hand)
@@ -1056,15 +1150,44 @@ class BlackjackGame:
             self.wallet_label.config(text=f"Bankroll: ${self.bankroll}")
 
     def hit(self):
-        self.deal_card(self.player_hands[self.active_hand])
         self.hits += 1
+        self.deal_card(self.player_hands[self.active_hand])
         player_value = self.calculate_hand_value(self.player_hands[self.active_hand])
+
         if player_value >= 21:
-            self.stands -= 1
-            self.stand()
+            if self.active_hand < len(self.player_hands) - 1:
+                self.active_hand += 1
+                self.highlight_active_hand()
+                return
+            else:
+                self.process_dealer_turn()
+                return
+
+        self.highlight_active_hand()
+
+    def process_dealer_turn(self):
+        # If no more hands to play, process the dealer's turn
+        if self.placeholder_frame:
+            self.placeholder_frame.destroy()
+            self.placeholder_frame = None
+
+        self.display_hand(self.dealer_hand[1], is_dealer=True)
+        while self.calculate_hand_value(self.dealer_hand) < 17:
+            self.deal_card(self.dealer_hand, is_dealer=True)
+
+        dealer_value = self.calculate_hand_value(self.dealer_hand)
+        player_values = [self.calculate_hand_value(hand) for idx, hand in enumerate(self.player_hands) if
+                         idx in self.remaining_hands.keys()]
+
+        # Compare dealer's hand with player's hands
+        for idx, player_value in enumerate(player_values):
+            self.compare_hands(player_value, dealer_value, idx)
 
         self.update_game_label(0)
         self.update_split_button_state()
+        self.update_surrender_button_state()
+        self.update_insurance_button_state()
+        self.reset_hand()
 
     def compare_hands(self, player_value, dealer_value, hand_idx):
         player_blackjack_win = player_value == 21
@@ -1107,6 +1230,7 @@ class BlackjackGame:
                 message += f"{self.log_prefix(hand_idx)} Player loses ${-reward}. Player Busts! {player_value}"
 
         self.log_message(message)
+        return player_blackjack_win, player_regular_win, draw, dealer_wins
 
     def stand(self):
         self.stands += 1
@@ -1115,13 +1239,20 @@ class BlackjackGame:
             self.highlight_active_hand()
             if self.active_hand < len(self.player_hands):
                 return
+            else:
+                self.active_hand -= 1
 
         # If no more hands to play, process the dealer's turn
+        if self.placeholder_frame:
+            self.placeholder_frame.destroy()
+            self.placeholder_frame = None
+
+        self.display_hand(self.dealer_hand[1], is_dealer=True)
         while self.calculate_hand_value(self.dealer_hand) < 17:
             self.deal_card(self.dealer_hand, is_dealer=True)
 
         dealer_value = self.calculate_hand_value(self.dealer_hand)
-        player_values = [self.calculate_hand_value(hand) for hand in self.player_hands]
+        player_values = [self.calculate_hand_value(hand) for idx, hand in enumerate(self.player_hands) if idx in self.remaining_hands.keys()]
 
         # Compare dealer's hand with player's hands
         for idx, player_value in enumerate(player_values):
@@ -1152,6 +1283,7 @@ class BlackjackGame:
         # Reinitialize hands and variables
         self.player_hands = [[]]
         self.dealer_hand = []
+        self.remaining_hands = {}
         self.active_hand = 0
 
         # Restart the game
@@ -1220,21 +1352,23 @@ class BlackjackEnvironment:
 
         self._blackjack_wins = 0
         self._regular_wins = 0
+        self._insurance_wins = 0
+        self._insurance_losses = 0
         self._losses = 0
         self._draws = 0
         self._hits = 0
         self._splits = 0
+        self._stands = 0
         self._doubles = 0
         self._surrenders = 0
-        self._insurance_wins = 0
-        self._insurance_losses = 0
-        self._stands = 0
+        self._insurance_used = False
         self._hand_count = 0
         self._active_hand = 0
         self._dealer_hand = []
         self._player_hands = [[]]
         self._dealer_hand_real = []
         self._player_hands_real = [[]]
+        self._probabilities = {'High': [5 / 13], 'Low': [5 / 13], 'Neutral': [3 / 13]}
         self.reset_deck()
 
     @property
@@ -1268,6 +1402,14 @@ class BlackjackEnvironment:
     @insurance_losses.setter
     def insurance_losses(self, insurance_losses):
         self._insurance_losses = insurance_losses
+
+    @property
+    def insurance_used(self):
+        return self._insurance_used
+
+    @insurance_used.setter
+    def insurance_used(self, insurance_used):
+        self._insurance_used = insurance_used
 
     @property
     def losses(self):
@@ -1373,6 +1515,14 @@ class BlackjackEnvironment:
     def player_hands_real(self, player_hands_real):
         self._player_hands_real = player_hands_real
 
+    @property
+    def probabilities(self):
+        return self._probabilities
+
+    @probabilities.setter
+    def probabilities(self, probabilities):
+        self._probabilities = probabilities
+
     def load_model(self, use_kan: bool = False):
         input_shape = (224, 224, 3)
         num_classes = 53  # 53 classes for 53 cards
@@ -1443,6 +1593,8 @@ class BlackjackEnvironment:
         self.player_hands_real[self.active_hand].append(second_player_card)
         self.dealer_hand.append(second_dealer_predicted_card)
         self.dealer_hand_real.append(second_dealer_card)
+
+        self.insurance_used = False
         
         return self.get_state()
 
@@ -1457,7 +1609,7 @@ class BlackjackEnvironment:
         usable_a = any(card[0] == 'ace' for card in self.player_hands[self.active_hand]) and self.calculate_hand_value(self.player_hands[self.active_hand]) + 10 <= 21
         can_split = len(self.player_hands_real[self.active_hand]) == 2 and self.player_hands_real[self.active_hand][0][0] == self.player_hands_real[self.active_hand][1][0]
         can_surrender = len(self.player_hands) == 1 and len(self.player_hands[0]) == 2
-        can_insure = self.dealer_hand[0][0] == 'ace'
+        can_insure = self.dealer_hand[0][0] == 'ace' and not self.insurance_used
         return (player_hand_value, dealer_upcard, usable_a, len(self.player_hands), can_insure, can_surrender, can_split)
 
     def step(self, action):
@@ -1468,51 +1620,30 @@ class BlackjackEnvironment:
             self.player_hands[self.active_hand].append(predicted_card)
             player_value = self.calculate_hand_value(self.player_hands_real[self.active_hand])
             dealer_value = self.calculate_hand_value(self.dealer_hand_real)
+
             if player_value > 21:
                 self.losses += 1
                 reward = -2
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             elif player_value == 21:
                 self.blackjack_wins += 1
                 reward = 3
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             elif player_value > dealer_value or dealer_value > 21:
                 self.regular_wins += 1
                 reward = 2
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             elif player_value < dealer_value <= 21:
                 self.losses += 1
                 reward = -2
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             else:
                 self.draws += 1
                 reward = 0
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
 
-                return self.get_state(), reward, done
+            if self.active_hand < len(self.player_hands) - 1:
+                done = False
+                self.active_hand += 1
+            else:
+                done = True
+
+            return self.get_state(), reward, done
 
         elif action == 'surrender' and len(self.player_hands_real) == 1 and len(self.player_hands_real[0]) == 2:
             self.surrenders += 1
@@ -1520,20 +1651,21 @@ class BlackjackEnvironment:
             done = True
             return self.get_state(), reward, done
 
-        elif action == 'insurance':
-            if self.dealer_hand_real[0][0] == 'ace':
-                dealer_value = self.calculate_hand_value(self.dealer_hand_real)
-                if dealer_value == 21:
-                    self.insurance_wins += 1
-                    reward = 1
-                else:
-                    self.insurance_losses += 1
-                    reward = -0.5
+        elif action == 'insurance' and not self.insurance_used and self.dealer_hand_real[0][0] == 'ace':
+            self.insurance_used = True
+            dealer_value = self.calculate_hand_value(self.dealer_hand_real)
+            if dealer_value == 21:
+                self.insurance_wins += 1
+                reward = 1
+            else:
+                self.insurance_losses += 1
+                reward = -0.5
 
-                done = False
-                return self.get_state(), reward, done
+            done = False
+            return self.get_state(), reward, done
 
         elif action == 'hit':
+            continue_flag = False
             self.hits += 1
             card, predicted_card = self.deal_card()
             self.player_hands_real[self.active_hand].append(card)
@@ -1542,23 +1674,23 @@ class BlackjackEnvironment:
             if player_value > 21:
                 self.losses += 1
                 reward = -1
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             elif player_value == 21:
                 self.blackjack_wins += 1
                 reward = 1.5
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             else:
-                return self.get_state(), 0, False
+                reward = 0
+                continue_flag = True
+
+            if self.active_hand < len(self.player_hands) - 1:
+                done = False
+                self.active_hand += 1
+            else:
+                if continue_flag:
+                    done = False
+                else:
+                    done = True
+
+            return self.get_state(), reward, done
 
         elif action == 'stand':
             self.stands += 1
@@ -1592,7 +1724,8 @@ class BlackjackEnvironment:
             done = True
             return self.get_state(), rewards, done
 
-        elif action == 'split' and len(self.player_hands_real[self.active_hand]) == 2 and self.player_hands_real[self.active_hand][0][0] == self.player_hands_real[self.active_hand][1][0]:
+        elif action == 'split' and len(self.player_hands_real[self.active_hand]) == 2 and \
+                self.player_hands_real[self.active_hand][0][0] == self.player_hands_real[self.active_hand][1][0]:
             self.splits += 1
             first_card, first_predicted_card = self.deal_card()
             second_card, second_predicted_card = self.deal_card()
@@ -1687,11 +1820,11 @@ class QLearningAgent:
 
     def save_model(self, filename):
         with open(filename, 'wb') as f:
-            pickle.dump(self.q_table, f)
+            pickle.dump(dict(self.q_table), f)
 
     def load_model(self, filename):
         with open(filename, 'rb') as f:
-            self.q_table = pickle.load(f)
+            self.q_table = defaultdict(lambda: np.zeros(len(self.actions)), pickle.load(f))
 
 
 class BlackjackRL:
@@ -1707,18 +1840,14 @@ class BlackjackRL:
         self.game_log = []
         self.training = False
 
-        # Get screen width and height
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
         # Set window size as a percentage of screen size
-        window_width = int(screen_width * 0.95)
-        window_height = int(screen_height * 0.9)
-        self.root.geometry(f"{window_width}x{window_height}")
+        self.window_width = int(self.root.winfo_screenwidth() * 0.95)
+        self.window_height = int(self.root.winfo_screenheight() * 0.9)
+        self.root.geometry(f"{self.window_width}x{self.window_height}")
 
         # Calculate padding as percentages of screen dimensions
-        self.padx = int(screen_width * 0.01)
-        self.pady = int(screen_height * 0.01)
+        self.padx = int(self.window_width * 0.01)
+        self.pady = int(self.window_height * 0.01)
         self.num_columns = 4
 
         # Load the trained model
@@ -1726,69 +1855,85 @@ class BlackjackRL:
         self.cnn_model = self.load_cnn_model()
         self.card_counter = CardCounter(model=self.cnn_model)
 
-        # Create frames
-        self.game_frame = tk.Frame(self.root)
-        self.game_frame.pack(side=tk.LEFT, padx=self.padx, pady=self.pady, expand=True, fill='both')
+        # Create main frames
+        self.main_frame = tk.Frame(self.root)
+        self.main_frame.pack(side=tk.LEFT, padx=self.padx, pady=self.pady, expand=True, fill='both')
+
         self.stats_frame = tk.Frame(self.root)
-        self.stats_frame.pack(side=tk.RIGHT, padx=self.padx, pady=self.pady, expand=True, fill='both')
+        self.stats_frame.pack(side=tk.RIGHT, padx=self.padx, pady=self.pady * 4, expand=True, fill='both')
+
+        self.game_frame = tk.Frame(self.main_frame)
+        self.game_frame.pack(side=tk.TOP, expand=True, fill='both')
+
+        # Store initial size of the game frame
+        self.initial_game_frame_size = (self.window_width // 2, self.window_height)
 
         # Create game widgets
-        self.player_label = tk.Label(self.game_frame, text="Player's Hand")
-        self.player_label.grid(row=0, column=0, columnspan=self.num_columns)
-        self.player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
-        for idx, frame in enumerate(self.player_frames):
+        self._player_label = tk.Label(self.game_frame, text="Player's Hand")
+        self._player_label.grid(row=0, column=0, columnspan=self.num_columns)
+        self._player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
+        for idx, frame in enumerate(self._player_frames):
             frame.grid(row=1, column=idx, padx=self.padx, pady=self.pady, sticky='nsew')
 
-        self.dealer_label = tk.Label(self.game_frame, text="Dealer's Hand")
-        self.dealer_label.grid(row=2, column=0, columnspan=self.num_columns, pady=(self.pady * 2, 0))
-        self.dealer_frame = tk.Frame(self.game_frame)
-        self.dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady, sticky='nsew')
+        self._dealer_label = tk.Label(self.game_frame, text="Dealer's Hand")
+        self._dealer_label.grid(row=2, column=0, pady=self.pady)
+        self._dealer_frame = tk.Frame(self.game_frame)
+        self._dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady,
+                                sticky='nsew')
 
-        self.start_button = tk.Button(self.game_frame, text="Start Training", command=self.start_training)
-        self.start_button.grid(row=4, column=0, padx=self.padx, pady=self.pady)
-        self.stop_button = tk.Button(self.game_frame, text="Stop Training", command=self.stop_training, state=tk.DISABLED)
-        self.stop_button.grid(row=4, column=1, padx=self.padx, pady=self.pady)
-        self.save_button = tk.Button(self.game_frame, text="Save Model", command=self.save_rl_model)
-        self.save_button.grid(row=5, column=0, padx=self.padx, pady=self.pady)
-        self.load_button = tk.Button(self.game_frame, text="Load Model", command=self.load_rl_model)
-        self.load_button.grid(row=5, column=1, padx=self.padx, pady=self.pady)
+        self._start_button = tk.Button(self.game_frame, text="Start Training", command=self.start_training)
+        self._start_button.grid(row=4, column=0, padx=self.padx, pady=self.pady)
+        self._stop_button = tk.Button(self.game_frame, text="Stop Training", command=self.stop_training,
+                                      state=tk.DISABLED)
+        self._stop_button.grid(row=4, column=1, padx=self.padx, pady=self.pady)
+        self._save_button = tk.Button(self.game_frame, text="Save Model", command=self.save_rl_model)
+        self._save_button.grid(row=5, column=0, padx=self.padx, pady=self.pady)
+        self._load_button = tk.Button(self.game_frame, text="Load Model", command=self.load_rl_model)
+        self._load_button.grid(row=5, column=1, padx=self.padx, pady=self.pady)
 
-        self.test_button = tk.Button(self.game_frame, text="Test Agent", command=lambda: self.test_agent(games=test_episodes), state=tk.DISABLED)
-        self.test_button.grid(row=6, column=0, columnspan=self.num_columns, pady=self.pady)
+        self._test_button = tk.Button(self.game_frame, text="Test Agent",
+                                      command=lambda: self.test_agent(games=test_episodes), state=tk.DISABLED)
+        self._test_button.grid(row=6, column=0, columnspan=self.num_columns, pady=self.pady)
 
         # Create stats widgets with adjusted sizes
-        fig_width = window_width / 3 / 100
-        fig_height = window_height / 3 / 100
+        fig_width = self.window_width / 4 / 100
+        fig_height = self.window_height / 3.5 / 100
 
         # Create stats widgets
         self.cumulative_rewards_fig, self.cumulative_rewards_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.cumulative_rewards_canvas = FigureCanvasTkAgg(self.cumulative_rewards_fig, master=self.stats_frame)
-        self.cumulative_rewards_canvas.get_tk_widget().grid(row=0, column=0)
+        self.cumulative_rewards_canvas.get_tk_widget().grid(row=0, column=0, pady=self.pady)
+        self.cumulative_rewards_fig.subplots_adjust(bottom=0.3)
 
         self.average_rewards_fig, self.average_rewards_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.average_rewards_canvas = FigureCanvasTkAgg(self.average_rewards_fig, master=self.stats_frame)
-        self.average_rewards_canvas.get_tk_widget().grid(row=0, column=1)
+        self.average_rewards_canvas.get_tk_widget().grid(row=0, column=1, pady=self.pady)
+        self.average_rewards_fig.subplots_adjust(bottom=0.3)
 
         self.win_loss_fig, self.win_loss_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.win_loss_canvas = FigureCanvasTkAgg(self.win_loss_fig, master=self.stats_frame)
-        self.win_loss_canvas.get_tk_widget().grid(row=1, column=0)
+        self.win_loss_canvas.get_tk_widget().grid(row=1, column=0, pady=self.pady)
+        self.win_loss_fig.subplots_adjust(bottom=0.3)
 
         self.prob_fig, self.prob_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.prob_canvas = FigureCanvasTkAgg(self.prob_fig, master=self.stats_frame)
-        self.prob_canvas.get_tk_widget().grid(row=1, column=1)
+        self.prob_canvas.get_tk_widget().grid(row=1, column=1, pady=self.pady)
+        self.prob_fig.subplots_adjust(bottom=0.3)
 
         self.q_values_fig, self.q_values_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.q_values_canvas = FigureCanvasTkAgg(self.q_values_fig, master=self.stats_frame)
-        self.q_values_canvas.get_tk_widget().grid(row=2, column=0)
+        self.q_values_canvas.get_tk_widget().grid(row=2, column=0, pady=self.pady)
+        self.q_values_fig.subplots_adjust(bottom=0.3)
 
         self.action_counts_fig, self.action_counts_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.action_counts_canvas = FigureCanvasTkAgg(self.action_counts_fig, master=self.stats_frame)
-        self.action_counts_canvas.get_tk_widget().grid(row=2, column=1)
+        self.action_counts_canvas.get_tk_widget().grid(row=2, column=1, pady=self.pady)
+        self.action_counts_fig.subplots_adjust(bottom=0.3)
 
         # Create a scrollable text widget for logs
-        self.log_frame = tk.Frame(self.game_frame)
-        self.log_frame.grid(row=7, column=0, columnspan=2, sticky='nsew')
-        self.log_text = tk.Text(self.log_frame, wrap=tk.WORD, state=tk.NORMAL, width=80, height=10)
+        self.log_frame = tk.Frame(self.main_frame)
+        self.log_frame.pack(side=tk.BOTTOM, fill='both')
+        self.log_text = tk.Text(self.log_frame, wrap=tk.WORD, state=tk.NORMAL, width=80, height=25)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.log_scrollbar = ttk.Scrollbar(self.log_frame, command=self.log_text.yview)
         self.log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1803,6 +1948,106 @@ class BlackjackRL:
     @probabilities.setter
     def probabilities(self, probabilities):
         self._probabilities = probabilities
+
+    @property
+    def player_label(self):
+        return self._player_label
+
+    @player_label.setter
+    def player_label(self, player_label):
+        self._player_label = player_label
+
+    @property
+    def player_frames(self):
+        return self._player_frames
+
+    @player_frames.setter
+    def player_frames(self, player_frames):
+        self._player_frames = player_frames
+
+    @property
+    def dealer_label(self):
+        return self._dealer_label
+
+    @dealer_label.setter
+    def dealer_label(self, dealer_label):
+        self._dealer_label = dealer_label
+
+    @property
+    def dealer_frame(self):
+        return self._dealer_frame
+
+    @dealer_frame.setter
+    def dealer_frame(self, dealer_frame):
+        self._dealer_frame = dealer_frame
+
+    @property
+    def start_button(self):
+        return self._start_button
+
+    @start_button.setter
+    def start_button(self, start_button):
+        self._start_button = start_button
+
+    @property
+    def stop_button(self):
+        return self._stop_button
+
+    @stop_button.setter
+    def stop_button(self, stop_button):
+        self._stop_button = stop_button
+
+    @property
+    def save_button(self):
+        return self._save_button
+
+    @save_button.setter
+    def save_button(self, save_button):
+        self._save_button = save_button
+
+    @property
+    def load_button(self):
+        return self._load_button
+
+    @load_button.setter
+    def load_button(self, load_button):
+        self._load_button = load_button
+
+    @property
+    def test_button(self):
+        return self._test_button
+
+    @test_button.setter
+    def test_button(self, test_button):
+        self._test_button = test_button
+
+    def reinitialize_game_frame(self):
+        # Create game widgets
+        self.player_label = tk.Label(self.game_frame, text="Player's Hand")
+        self.player_label.grid(row=0, column=0, columnspan=self.num_columns)
+        self.player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
+        for idx, frame in enumerate(self.player_frames):
+            frame.grid(row=1, column=idx, padx=self.padx, pady=self.pady, sticky='nsew')
+
+        self.dealer_label = tk.Label(self.game_frame, text="Dealer's Hand")
+        self.dealer_label.grid(row=2, column=0, pady=self.pady)
+        self.dealer_frame = tk.Frame(self.game_frame)
+        self.dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady,
+                               sticky='nsew')
+
+        self.start_button = tk.Button(self.game_frame, text="Start Training", command=self.start_training,
+                                     state=tk.DISABLED)
+        self.start_button.grid(row=4, column=0, padx=self.padx, pady=self.pady)
+        self.stop_button = tk.Button(self.game_frame, text="Stop Training", command=self.stop_training)
+        self.stop_button.grid(row=4, column=1, padx=self.padx, pady=self.pady)
+        self.save_button = tk.Button(self.game_frame, text="Save Model", command=self.save_rl_model)
+        self.save_button.grid(row=5, column=0, padx=self.padx, pady=self.pady)
+        self.load_button = tk.Button(self.game_frame, text="Load Model", command=self.load_rl_model)
+        self.load_button.grid(row=5, column=1, padx=self.padx, pady=self.pady)
+
+        self.test_button = tk.Button(self.game_frame, text="Test Agent",
+                                     command=lambda: self.test_agent(games=self.test_episodes), state=tk.DISABLED)
+        self.test_button.grid(row=6, column=0, columnspan=self.num_columns, pady=self.pady)
 
     def load_cnn_model(self, use_kan: bool = False):
         input_shape = (224, 224, 3)
@@ -1829,37 +2074,6 @@ class BlackjackRL:
         if file_path:
             self.agent.load_model(file_path)
             print(f"Model loaded from: {file_path}")
-
-    def display_hand(self, hand, frame):
-        for widget in frame.winfo_children():
-            widget.destroy()
-
-        for i, card in enumerate(hand):
-            img_path = f'./data/test/{card[0]} of {card[1]}/1.jpg'
-
-            # Debugging: Check if the image path exists
-            if not os.path.exists(img_path):
-                print(f"Image path does not exist: {img_path}")
-                continue
-
-            images = [tf.image.decode_jpeg(tf.io.read_file(img_path), channels=3)]
-            prob_high, prob_low, prob_neutral, predicted_cards = self.card_counter.count_cards(images=images)
-            predicted_card = predicted_cards[0]
-
-            try:
-                img = Image.open(img_path)
-                img = img.resize((100, 150), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self.card_images.append(photo)  # Keep a reference to the image
-                label = tk.Label(frame, image=photo)
-                label.image = photo  # Ensure reference is kept by the label
-                label.grid(row=0, column=i)
-                frame_text = f'Actual: {card[0]} of {card[1]}\nPredicted: {predicted_card[0]} of {predicted_card[1]}'
-                tk.Label(frame, text=frame_text).grid(row=1, column=i)
-            except Exception as e:
-                print(f"Failed to load image {img_path}: {e}")
-
-        return hand
 
     def update_stats(self):
         # Update cumulative rewards plot
@@ -1895,6 +2109,7 @@ class BlackjackRL:
         self.win_loss_ax.bar(win_data.keys(), win_data.values())
         self.win_loss_ax.set_title("Wins, Losses, Draws")
         self.win_loss_ax.set_ylabel("Count")
+        self.win_loss_ax.tick_params(axis='x', rotation=45)
         self.win_loss_canvas.draw()
 
         # Update probability plot
@@ -1939,6 +2154,7 @@ class BlackjackRL:
         self.action_counts_canvas.draw()
 
     def log_message(self, message):
+        message = f'Episode {self.episode_count}: {message}'
         self.game_log.append(message)
         self.log_text.config(state=tk.NORMAL)
         self.log_text.insert(tk.END, message + "\n")
@@ -1960,21 +2176,20 @@ class BlackjackRL:
 
     def reset_game(self):
         self.environment.reset()
-        for frame in self.player_frames:
-            for widget in frame.winfo_children():
-                widget.destroy()
+        self.clear_frames(self.player_frames)
+        self.clear_frames([self.dealer_frame])
 
-        for widget in self.dealer_frame.winfo_children():
+        for widget in self.game_frame.winfo_children():
             widget.destroy()
 
-        self.player_frames = [tk.Frame(self.game_frame) for _ in range(4)]
-        for idx, frame in enumerate(self.player_frames):
-            frame.grid(row=1, column=idx, padx=self.padx, pady=self.pady, sticky='nsew')
-
-        self.dealer_frame = tk.Frame(self.game_frame)
-        self.dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady, sticky='nsew')
-
+        # Reset the size of the game_frame
+        self.reinitialize_game_frame()
         self.update_stats()
+
+    def clear_frames(self, frames):
+        for frame in frames:
+            for widget in frame.winfo_children():
+                widget.destroy()
 
     def train_agent(self):
         if not self.training:
@@ -1987,6 +2202,8 @@ class BlackjackRL:
             self.root.update_idletasks()
             self.root.update()
             action = self.agent.choose_action(state)
+            self.log_message(f"Player Hand: {self.environment.player_hands[self.environment.active_hand]}")
+            self.log_message(f"Action: {action}")
             next_state, reward, done = self.environment.step(action)
             self.agent.update_q_value(state, action, reward, next_state)
             state = next_state
@@ -1995,17 +2212,56 @@ class BlackjackRL:
                 self.episode_count += 1
                 self.agent.rewards.append(reward)
                 self.update_stats()
-                self.log_message(f"Episode {self.episode_count}: Reward {reward}")
+                self.log_message(f"Reward {reward}")
                 self.root.after(1000, self.train_agent)
                 break
 
             self.root.after(1000, lambda: None)  # Add delay for visualization
 
     def update_hand_display(self):
-        for idx, hand in enumerate(self.environment.player_hands_real):
-            self.display_hand(hand, self.player_frames[idx])
+        if not self.root:
+            return
 
-        self.display_hand(self.environment.dealer_hand_real, self.dealer_frame)
+        # Update player hands without clearing frames
+        for idx, player_hand in enumerate(self.environment.player_hands_real):
+            for card_idx, card in enumerate(player_hand):
+                predicted_card = self.environment.player_hands[idx][card_idx]
+                img_path = f'./data/test/{card[0]} of {card[1]}/1.jpg'
+                if os.path.exists(img_path):
+                    try:
+                        img = Image.open(img_path)
+                        img = img.resize((100, 150), Image.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        self.card_images.append(photo)  # Keep a reference to the image
+                        frame = self.player_frames[idx]
+                        label = tk.Label(frame, image=photo)
+                        label.image = photo  # Ensure reference is kept by the label
+                        label.grid(row=0, column=card_idx, padx=self.padx // 2, pady=self.pady // 2)
+                        frame_text = f'Actual: {card[0]} of {card[1]}\nPredicted: {predicted_card[0]} of {predicted_card[1]}'
+                        tk.Label(frame, text=frame_text).grid(row=1, column=card_idx, padx=self.padx // 2,
+                                                              pady=self.pady // 2)
+                    except Exception as e:
+                        print(f"Failed to load image {img_path}: {e}")
+
+        # Update dealer hand
+        for idx, dealer_card in enumerate(self.environment.dealer_hand_real):
+            img_path = f'./data/test/{dealer_card[0]} of {dealer_card[1]}/1.jpg'
+            dealer_predicted_card = self.environment.dealer_hand[idx]
+            if os.path.exists(img_path):
+                try:
+                    img = Image.open(img_path)
+                    img = img.resize((100, 150), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self.card_images.append(photo)  # Keep a reference to the image
+                    frame = self.dealer_frame
+                    label = tk.Label(frame, image=photo)
+                    label.image = photo  # Ensure reference is kept by the label
+                    label.grid(row=0, column=idx, padx=self.padx // 2, pady=self.pady // 2)
+                    frame_text = f'Actual: {dealer_card[0]} of {dealer_card[1]}\nPredicted: {dealer_predicted_card[0]} of {dealer_predicted_card[1]}'
+                    tk.Label(frame, text=frame_text).grid(row=1, column=idx, padx=self.padx // 2,
+                                                          pady=self.pady // 2)
+                except Exception as e:
+                    print(f"Failed to load image {img_path}: {e}")
 
     def test_agent(self, games=100):
         wins, losses, draws = 0, 0, 0
@@ -2182,11 +2438,15 @@ class DQNAgent:
         if self.episode_count % self.target_update_freq == 0:
             self.update_target_network()
 
-    def load_model(self, name):
-        self.model.load_weights(name)
-
     def save_model(self, name):
-        self.model.save_weights(name)
+        extensionless_name = name.split('model.weights.h5')[0]
+        self.model.save_weights(f"{extensionless_name}model.weights.h5")
+        self.target_model.save_weights(f"{extensionless_name}target_model.weights.h5")
+
+    def load_model(self, name):
+        target_name = f"{name.split('model.weights.h5')[0]}target_model.weights.h5"
+        self.model.load_weights(name)
+        self.target_model.load_weights(target_name)
 
 
 class DQNBlackjackEnvironment:
@@ -2234,6 +2494,7 @@ class DQNBlackjackEnvironment:
         self._dealer_hand_real = []
         self._player_hands_real = [[]]
         self._probabilities = {'High': [5 / 13], 'Low': [5 / 13], 'Neutral': [3 / 13]}
+        self._insurance_used = False
         self.reset_deck()
 
     @property
@@ -2380,6 +2641,14 @@ class DQNBlackjackEnvironment:
     def probabilities(self, probabilities):
         self._probabilities = probabilities
 
+    @property
+    def insurance_used(self):
+        return self._insurance_used
+
+    @insurance_used.setter
+    def insurance_used(self, insurance_used):
+        self._insurance_used = insurance_used
+
     def load_model(self, use_kan: bool = False):
         input_shape = (224, 224, 3)
         num_classes = 53  # 53 classes for 53 cards
@@ -2452,6 +2721,8 @@ class DQNBlackjackEnvironment:
         self.dealer_hand.append(second_dealer_predicted_card)
         self.dealer_hand_real.append(second_dealer_card)
 
+        self.insurance_used = False
+
         return self.get_state()
 
     def reset_deck(self):
@@ -2472,7 +2743,7 @@ class DQNBlackjackEnvironment:
         return [player_hand_value] + dealer_visible_card + [usable_a] + [self.probabilities['High'][-1], self.probabilities['Low'][-1], self.probabilities['Neutral'][-1], self.can_insure(), self.can_surrender(), self.can_split()]
 
     def can_insure(self):
-        return self.dealer_hand[0][0] == 'ace'
+        return self.dealer_hand[0][0] == 'ace' and not self.insurance_used
 
     def can_surrender(self):
         return len(self.player_hands) == 1 and len(self.player_hands[0]) == 2
@@ -2491,51 +2762,30 @@ class DQNBlackjackEnvironment:
             self.player_hands[self.active_hand].append(predicted_card)
             player_value = self.calculate_hand_value(self.player_hands_real[self.active_hand])
             dealer_value = self.calculate_hand_value(self.dealer_hand_real)
+
             if player_value > 21:
                 self.losses += 1
                 reward = -2
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             elif player_value == 21:
                 self.blackjack_wins += 1
                 reward = 3
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             elif player_value > dealer_value or dealer_value > 21:
                 self.regular_wins += 1
                 reward = 2
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             elif player_value < dealer_value <= 21:
                 self.losses += 1
                 reward = -2
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
-
-                return self.get_state(), reward, done
             else:
                 self.draws += 1
                 reward = 0
-                if self.active_hand == len(self.player_hands) - 1:
-                    done = True
-                else:
-                    done = False
 
-                return self.get_state(), reward, done
+            if self.active_hand < len(self.player_hands) - 1:
+                done = False
+                self.active_hand += 1
+            else:
+                done = True
+
+            return self.get_state(), reward, done
 
         elif action == 'surrender' and len(self.player_hands_real) == 1 and len(self.player_hands_real[0]) == 2:
             self.surrenders += 1
@@ -2543,18 +2793,18 @@ class DQNBlackjackEnvironment:
             done = True
             return self.get_state(), reward, done
 
-        elif action == 'insurance':
-            if self.dealer_hand_real[0][0] == 'ace':
-                dealer_value = self.calculate_hand_value(self.dealer_hand_real)
-                if dealer_value == 21:
-                    self.insurance_wins += 1
-                    reward = 1
-                else:
-                    self.insurance_losses += 1
-                    reward = -0.5
+        elif action == 'insurance' and self.dealer_hand_real[0][0] == 'ace':
+            self.insurance_used = True
+            dealer_value = self.calculate_hand_value(self.dealer_hand_real)
+            if dealer_value == 21:
+                self.insurance_wins += 1
+                reward = 1
+            else:
+                self.insurance_losses += 1
+                reward = -0.5
 
-                done = False
-                return self.get_state(), reward, done
+            done = False
+            return self.get_state(), reward, done
 
         if action == 'hit':
             self.hits += 1
@@ -2565,27 +2815,21 @@ class DQNBlackjackEnvironment:
             if player_value > 21:
                 self.losses += 1
                 reward = -1
-                done = True
-                if self.active_hand < len(self.player_hands):
+                if self.active_hand < len(self.player_hands) - 1:
+                    done = False
                     self.active_hand += 1
-                    if self.active_hand < len(self.player_hands):
-                        done = False
-                    else:
-                        done = True
-                        self.active_hand -= 1
+                else:
+                    done = True
 
                 return self.get_state(), reward, done
             elif player_value == 21:
                 self.blackjack_wins += 1
                 reward = 1.5
-                done = True
-                if self.active_hand < len(self.player_hands):
+                if self.active_hand < len(self.player_hands) - 1:
+                    done = False
                     self.active_hand += 1
-                    if self.active_hand < len(self.player_hands):
-                        done = False
-                    else:
-                        done = True
-                        self.active_hand -= 1
+                else:
+                    done = True
 
                 return self.get_state(), reward, done
             else:
@@ -2722,34 +2966,42 @@ class DQNBlackjackRL:
         self.cumulative_rewards_fig, self.cumulative_rewards_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.cumulative_rewards_canvas = FigureCanvasTkAgg(self.cumulative_rewards_fig, master=self.stats_frame)
         self.cumulative_rewards_canvas.get_tk_widget().grid(row=0, column=0)
+        self.cumulative_rewards_fig.subplots_adjust(bottom=0.3)
 
         self.average_rewards_fig, self.average_rewards_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.average_rewards_canvas = FigureCanvasTkAgg(self.average_rewards_fig, master=self.stats_frame)
         self.average_rewards_canvas.get_tk_widget().grid(row=0, column=1)
+        self.average_rewards_fig.subplots_adjust(bottom=0.3)
 
         self.win_loss_fig, self.win_loss_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.win_loss_canvas = FigureCanvasTkAgg(self.win_loss_fig, master=self.stats_frame)
         self.win_loss_canvas.get_tk_widget().grid(row=1, column=0)
+        self.win_loss_fig.subplots_adjust(bottom=0.3)
 
         self.prob_fig, self.prob_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.prob_canvas = FigureCanvasTkAgg(self.prob_fig, master=self.stats_frame)
         self.prob_canvas.get_tk_widget().grid(row=1, column=1)
+        self.prob_fig.subplots_adjust(bottom=0.3)
 
         self.q_values_fig, self.q_values_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.q_values_canvas = FigureCanvasTkAgg(self.q_values_fig, master=self.stats_frame)
         self.q_values_canvas.get_tk_widget().grid(row=2, column=0)
+        self.q_values_fig.subplots_adjust(bottom=0.3)
 
         self.action_counts_fig, self.action_counts_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.action_counts_canvas = FigureCanvasTkAgg(self.action_counts_fig, master=self.stats_frame)
         self.action_counts_canvas.get_tk_widget().grid(row=2, column=1)
+        self.action_counts_fig.subplots_adjust(bottom=0.3)
 
         self.loss_fig, self.loss_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.loss_canvas = FigureCanvasTkAgg(self.loss_fig, master=self.stats_frame)
         self.loss_canvas.get_tk_widget().grid(row=3, column=0)
+        self.loss_fig.subplots_adjust(bottom=0.3)
 
         self.learning_rate_fig, self.learning_rate_ax = plt.subplots(figsize=(fig_width, fig_height))
         self.learning_rate_canvas = FigureCanvasTkAgg(self.learning_rate_fig, master=self.stats_frame)
         self.learning_rate_canvas.get_tk_widget().grid(row=3, column=1)
+        self.learning_rate_fig.subplots_adjust(bottom=0.3)
 
         # Create a scrollable text widget for logs
         self.log_frame = tk.Frame(self.main_frame)
@@ -2856,10 +3108,10 @@ class DQNBlackjackRL:
         self.dealer_frame.grid(row=3, column=0, columnspan=self.num_columns, padx=self.padx, pady=self.pady,
                                sticky='nsew')
 
-        self.start_button = tk.Button(self.game_frame, text="Start Training", command=self.start_training)
-        self.start_button.grid(row=4, column=0, padx=self.padx, pady=self.pady)
-        self.stop_button = tk.Button(self.game_frame, text="Stop Training", command=self.stop_training,
+        self.start_button = tk.Button(self.game_frame, text="Start Training", command=self.start_training,
                                      state=tk.DISABLED)
+        self.start_button.grid(row=4, column=0, padx=self.padx, pady=self.pady)
+        self.stop_button = tk.Button(self.game_frame, text="Stop Training", command=self.stop_training)
         self.stop_button.grid(row=4, column=1, padx=self.padx, pady=self.pady)
         self.save_button = tk.Button(self.game_frame, text="Save Model", command=self.save_rl_model)
         self.save_button.grid(row=5, column=0, padx=self.padx, pady=self.pady)
@@ -2889,6 +3141,8 @@ class DQNBlackjackRL:
         file_path = filedialog.asksaveasfilename(defaultextension=".h5",
                                                  filetypes=[("H5 files", "*.h5"), ("PKL files", "*.pkl"),
                                                             ("All files", "*.*")])
+
+        file_path = f"{file_path.split('.h5')[0]}.weights.h5"
         if file_path:
             self.agent.save_model(file_path)
             print(f"Model saved to: {file_path}")
@@ -2934,6 +3188,7 @@ class DQNBlackjackRL:
         self.win_loss_ax.bar(win_data.keys(), win_data.values())
         self.win_loss_ax.set_title("Wins, Losses, Draws")
         self.win_loss_ax.set_ylabel("Count")
+        self.win_loss_ax.tick_params(axis='x', rotation=45)
         self.win_loss_canvas.draw()
 
         # Update probability plot
@@ -3134,8 +3389,8 @@ if __name__ == '__main__':
     model_path = f'./models/{epochs}_model.h5'
 
     # Train the CNN model
-    model1 = train_model(epochs=epochs)
-    model = train_model(epochs=epochs, use_kan=True)
+    model = train_model(epochs=epochs)
+    # model = train_model(epochs=epochs, use_kan=True)
 
     # # Make predictions
     image_paths = [r'.\data\test\ace of clubs\1.jpg', r'.\data\test\nine of clubs\1.jpg',
@@ -3159,7 +3414,7 @@ if __name__ == '__main__':
 
     # Create a Q-Learning Reinforcement Learning model to learn to play blackjack
     env = BlackjackEnvironment(model_path)
-    actions = ['hit', 'stand', 'insurance', 'surrender', 'split']
+    actions = ['hit', 'stand', 'double', 'insurance', 'surrender', 'split']
     agent = QLearningAgent(action_space=actions)
     root = tk.Tk()
     app = BlackjackRL(
